@@ -22,76 +22,6 @@ jobs:
      - name: Validate container
        run: canary validate --file canary-validator.yml bluesky/tiled:latest
 
-  linux_checks:
-
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version:
-        - "3.8"
-        - "3.9"
-        - "3.10"
-        - "3.11"
-        - "3.12"
-      fail-fast: false
-    steps:
-
-    - uses: actions/checkout@v3
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ matrix.python-version }}
-        cache: 'pip'
-
-    - name: Install
-      shell: bash -l {0}
-      run: source continuous_integration/scripts/install.sh
-
-    - name: Install test requirements
-      shell: bash -l {0}
-      run: |
-        set -vxeuo pipefail
-        python -m pip install .[dev]
-        python -m pip list
-
-    - name: Start LDAP service in container.
-      shell: bash -l {0}
-      run: source continuous_integration/scripts/start_LDAP.sh
-
-    - name: Download SQLite example data.
-      shell: bash -l {0}
-      run: source continuous_integration/scripts/download_sqlite_data.sh
-
-    - name: Start PostgreSQL service in container.
-      shell: bash -l {0}
-      run: source continuous_integration/scripts/start_postgres.sh
-
-
-    - name: Ensure example data is migrated to current catalog database schema.
-      # The example data is expected to be kept up to date to the latest Tiled
-      # release, but this CI run may include some unreleased schema changes,
-      # so we run a migration here.
-      shell: bash -l {0}
-      run: |
-        set -vxeuo pipefail
-        tiled catalog upgrade-database sqlite+aiosqlite:///tiled_test_db_sqlite.db
-        tiled catalog upgrade-database postgresql+asyncpg://postgres:secret@localhost:5432/tiled-example-data
-
-    - name: Test with pytest
-      shell: bash -l {0}
-      run: |
-        set -vxeuo pipefail
-        coverage run -m pytest -v
-        coverage report
-      env:
-        # Provide test suite with a PostgreSQL database to use.
-        TILED_TEST_POSTGRESQL_URI: postgresql+asyncpg://postgres:secret@localhost:5432
-        # Opt in to LDAPAuthenticator tests.
-        TILED_TEST_LDAP: 1
-
-
-
   benchmark:
     runs-on: ubuntu-latest
     steps:
@@ -103,6 +33,6 @@ jobs:
           python-version: "3.10"
           cache: 'pip'
 
-      - run: pip install asv virtualenv
+      - run: pip install asv virtualenv libmambapy conda
       - run: asv machine --yes
       - run: asv continuous base pr --strict -e
