@@ -35,30 +35,38 @@ jobs:
 
       - name: Install
         shell: bash -l {0}
-        run: source continuous_integration/scripts/install.sh
-
-      - name: Install test requirements
-        shell: bash -l {0}
         run: |
-          set -vxeuo pipefail
-          python -m pip install .[dev]
-          python -m pip list
+          echo "Running!"
+          pip install requests_html
+          pip install libmambapy
+          pip install asv
+          asv run
+        # asv machine --yes
+        # asv continuous base pr --strict -e
+        # run: source continuous_integration/scripts/install.sh
 
-      - name: Start LDAP service in container.
-        shell: bash -l {0}
-        run: source continuous_integration/scripts/start_LDAP.sh
+      # - name: Install test requirements
+      #   shell: bash -l {0}
+      #   run: |
+      #     set -vxeuo pipefail
+      #     python -m pip install .[dev]
+      #     python -m pip list
 
-      - name: Download SQLite example data.
-        shell: bash -l {0}
-        run: source continuous_integration/scripts/download_sqlite_data.sh
+      # - name: Start LDAP service in container.
+      #   shell: bash -l {0}
+      #   run: source continuous_integration/scripts/start_LDAP.sh
 
-      - name: Start PostgreSQL service in container.
-        shell: bash -l {0}
-        run: source continuous_integration/scripts/start_postgres.sh
+      # - name: Download SQLite example data.
+      #   shell: bash -l {0}
+      #   run: source continuous_integration/scripts/download_sqlite_data.sh
 
-      - run: pip install asv virtualenv libmambapy conda
-      - run: asv machine --yes
-      - run: asv continuous base pr --strict -e
+      # - name: Start PostgreSQL service in container.
+      #   shell: bash -l {0}
+      #   run: source continuous_integration/scripts/start_postgres.sh
+
+      # - run: pip install asv virtualenv libmambapy conda
+      # - run: asv machine --yes
+      # - run: asv continuous base pr --strict -e
 
   # checks:
 
