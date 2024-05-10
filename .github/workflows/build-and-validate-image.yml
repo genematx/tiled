@@ -57,6 +57,11 @@ jobs:
         set -vxeuo pipefail
         python -m pip install .[dev]
         python -m pip list
+    
+    - name: Run ASV
+      shell: bash -l {0}
+      run: |
+        asv run --python=same
 
     - name: Start LDAP service in container.
       shell: bash -l {0}
@@ -103,7 +108,7 @@ jobs:
           python-version: "3.10"
       - uses: actions/checkout@v3
       # - run: git fetch origin $GITHUB_BASE_REF:base $GITHUB_REF:pr
-      - run: pip install asv virtualenv conda-libmamba-solver
+      - run: pip install asv virtualenv libmambapy
       - run: asv machine --yes
       - run: asv continuous base pr --strict -e
 
