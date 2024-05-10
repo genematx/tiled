@@ -30,8 +30,13 @@ jobs:
 
     - uses: actions/checkout@v3
 
+    - name: Setup Miniforge
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        miniforge-version: "latest"
+
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: "3.10"
         cache: 'pip'
@@ -39,6 +44,12 @@ jobs:
     - name: Install
       shell: bash -l {0}
       run: source continuous_integration/scripts/install.sh
+
+    - name: Install asv
+      shell: bash -l {0}
+      run: |
+        echo "Installing ASV"
+        python -m pip install asv
 
     - name: Install test requirements
       shell: bash -l {0}
@@ -81,6 +92,20 @@ jobs:
         TILED_TEST_POSTGRESQL_URI: postgresql+asyncpg://postgres:secret@localhost:5432
         # Opt in to LDAPAuthenticator tests.
         TILED_TEST_LDAP: 1
+
+  benchmark2:
+    name: benchmark 3.10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup python 3.10
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.10"
+      - uses: actions/checkout@v3
+      # - run: git fetch origin $GITHUB_BASE_REF:base $GITHUB_REF:pr
+      - run: pip install asv virtualenv
+      - run: asv machine --yes
+      - run: asv continuous base pr --strict -e
 
   benchmark:
     runs-on: ubuntu-latest
