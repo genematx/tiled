@@ -23,7 +23,7 @@ jobs:
        run: canary validate --file canary-validator.yml bluesky/tiled:latest
 
 
-linux_checks:
+  linux_checks:
 
     runs-on: ubuntu-latest
     steps:
