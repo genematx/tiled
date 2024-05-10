@@ -70,11 +70,11 @@ jobs:
           CACHE_NUMBER: 0
         id: cache
 
-      - name: Update environment
-        run:
-          conda env update -n asv-bench -f
-          ./build_envs/asv-bench.yml
-        if: steps.cache.outputs.cache-hit != 'true'
+      # - name: Update environment
+      #   run:
+      #     conda env update -n asv-bench -f
+      #     ./build_envs/asv-bench.yml
+      #   if: steps.cache.outputs.cache-hit != 'true'
 
       - name: Conda list
         run: |
@@ -92,7 +92,7 @@ jobs:
         run: |
           cd benchmarks
           asv machine --machine GH-Actions --os ubuntu-latest --arch x64 --cpu "2-core unknown" --ram 7GB
-          asv run 
+          asv run --python=same
       # v2023.02.0..main --skip-existing --parallel || true
 
       # - name: Commit and push benchmark results
