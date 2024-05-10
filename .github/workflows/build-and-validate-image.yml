@@ -94,7 +94,7 @@ jobs:
         TILED_TEST_LDAP: 1
 
   benchmark2:
-    name: benchmark 3.10
+    name: benchmark2
     runs-on: ubuntu-latest
     steps:
       - name: Setup python 3.10
@@ -103,7 +103,7 @@ jobs:
           python-version: "3.10"
       - uses: actions/checkout@v3
       # - run: git fetch origin $GITHUB_BASE_REF:base $GITHUB_REF:pr
-      - run: pip install asv virtualenv
+      - run: pip install asv virtualenv conda-libmamba-solver
       - run: asv machine --yes
       - run: asv continuous base pr --strict -e
 
