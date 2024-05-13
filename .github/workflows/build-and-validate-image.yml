@@ -135,7 +135,6 @@ jobs:
       - name: Run benchmarks
         id: benchmark
         run: |
-          cd benchmarks
           asv machine --machine GH-Actions --os ubuntu-latest --arch x64 --cpu "2-core unknown" --ram 7GB
           asv run --skip-existing --parallel || true
 
