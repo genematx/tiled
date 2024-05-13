@@ -159,7 +159,7 @@ jobs:
         if: github.ref == 'refs/heads/main' && github.repository == 'genematx/tiled-benchmarks'
         uses: ad-m/github-push-action@master
         with:
-          # github_token: ${{ secrets.COMP_ASV_PAT }}
+          github_token: ${{ secrets.REPO_PAT }}
           branch: main
           force: true
           repository: genematx/tiled-benchmarks
