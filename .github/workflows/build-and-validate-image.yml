@@ -23,7 +23,7 @@ jobs:
        run: canary validate --file canary-validator.yml bluesky/tiled:latest
 
 
-  linux_checks:
+  benchmark:
 
     runs-on: ubuntu-latest
     steps:
@@ -51,12 +51,12 @@ jobs:
         echo "Installing ASV"
         python -m pip install asv
 
-    - name: Install test requirements
-      shell: bash -l {0}
-      run: |
-        set -vxeuo pipefail
-        python -m pip install .[dev]
-        python -m pip list
+    # - name: Install test requirements
+    #   shell: bash -l {0}
+    #   run: |
+    #     set -vxeuo pipefail
+    #     python -m pip install .[dev]
+    #     python -m pip list
     
     - name: Run ASV
       shell: bash -l {0}
@@ -64,66 +64,17 @@ jobs:
         asv machine --yes
         asv run --python=same
 
-    - name: Start LDAP service in container.
-      shell: bash -l {0}
-      run: source continuous_integration/scripts/start_LDAP.sh
-
-    - name: Download SQLite example data.
-      shell: bash -l {0}
-      run: source continuous_integration/scripts/download_sqlite_data.sh
-
-    - name: Start PostgreSQL service in container.
-      shell: bash -l {0}
-      run: source continuous_integration/scripts/start_postgres.sh
-
-
-    - name: Ensure example data is migrated to current catalog database schema.
-      # The example data is expected to be kept up to date to the latest Tiled
-      # release, but this CI run may include some unreleased schema changes,
-      # so we run a migration here.
-      shell: bash -l {0}
-      run: |
-        set -vxeuo pipefail
-        tiled catalog upgrade-database sqlite+aiosqlite:///tiled_test_db_sqlite.db
-        tiled catalog upgrade-database postgresql+asyncpg://postgres:secret@localhost:5432/tiled-example-data
-
-    - name: Test with pytest
-      shell: bash -l {0}
-      run: |
-        set -vxeuo pipefail
-        coverage run -m pytest -v
-        coverage report
-      env:
-        # Provide test suite with a PostgreSQL database to use.
-        TILED_TEST_POSTGRESQL_URI: postgresql+asyncpg://postgres:secret@localhost:5432
-        # Opt in to LDAPAuthenticator tests.
-        TILED_TEST_LDAP: 1
-
-  benchmark2:
-    name: benchmark2
-    runs-on: ubuntu-latest
-    steps:
-      - name: Setup python 3.10
-        uses: actions/setup-python@v2
-        with:
-          python-version: "3.10"
-      - uses: actions/checkout@v3
-      # - run: git fetch origin $GITHUB_BASE_REF:base $GITHUB_REF:pr
-      - run: pip install asv virtualenv libmambapy
-      - run: asv machine --yes
-      - run: asv continuous base pr --strict -e
-
-  benchmark:
+  benchmark_matrix:
     runs-on: ubuntu-latest
     defaults:
       run:
         shell: bash -el {0}
-    env:
-      CONDA_ENV_FILE: ./build_envs/asv-bench.yml
-      ASV_DIR: ./benchmarks
+    # env:
+    #   CONDA_ENV_FILE: ./build_envs/asv-bench.yml
+    #   ASV_DIR: ./benchmarks
 
     steps:
-      - name: Checkout
+      - name: Checkout tiled
         uses: actions/checkout@v4
         with:
           repository: bluesky/tiled
@@ -141,25 +92,20 @@ jobs:
         uses: conda-incubator/setup-miniconda@v3
         with:
           miniforge-version: "latest"
-          activate-environment: asv-bench
+          # activate-environment: asv-bench
 
-      - name: Get date
-        id: get-date
-        run: echo "today=$(/bin/date -u '+%Y%m%d')" >> $GITHUB_OUTPUT
-        shell: bash
-
-      - name: Cache environment
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CONDA }}/envs
-          key:
-            conda-${{ runner.os }}--${{ runner.arch }}--${{
-            steps.get-date.outputs.today }}-${{
-            hashFiles('./build_envs/asv-bench.yml') }}-${{ env.CACHE_NUMBER}}
-        env:
-          # Increase this value to reset cache if the environment file has not changed
-          CACHE_NUMBER: 0
-        id: cache
+      # - name: Cache environment
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: ${{ env.CONDA }}/envs
+      #     key:
+      #       conda-${{ runner.os }}--${{ runner.arch }}--${{
+      #       steps.get-date.outputs.today }}-${{
+      #       hashFiles('./build_envs/asv-bench.yml') }}-${{ env.CACHE_NUMBER}}
+      #   env:
+      #     # Increase this value to reset cache if the environment file has not changed
+      #     CACHE_NUMBER: 0
+      #   id: cache
 
       # - name: Update environment
       #   run:
@@ -172,19 +118,18 @@ jobs:
           conda info
           conda list
 
-      # - name: Copy existing results
-      #   run: |
-      #     if [ -d "geocat-comp-asv/results" ]; then
-      #       cp -r geocat-comp-asv/results benchmarks/
-      #     fi
+      - name: Copy existing results
+        run: |
+          if [ -d "geocat-comp-asv/results" ]; then
+            cp -r geocat-comp-asv/results benchmarks/
+          fi
 
       - name: Run benchmarks
         id: benchmark
         run: |
           cd benchmarks
           asv machine --machine GH-Actions --os ubuntu-latest --arch x64 --cpu "2-core unknown" --ram 7GB
-          asv run --python=same
-      # v2023.02.0..main --skip-existing --parallel || true
+          asv run v2023.02.0..main --skip-existing --parallel || true
 
       # - name: Commit and push benchmark results
       #   run: |
@@ -208,117 +153,3 @@ jobs:
       #     repository: NCAR/geocat-comp-asv
       #     directory: geocat-comp-asv
 
-
-
-
-  # benchmark:
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v3
-  #     - uses: mamba-org/setup-micromamba@v1
-  #       with:
-  #         micromamba-version: "latest"
-  #         init-shell: bash
-  #         post-cleanup: 'all'
-  #         auto-activate-base: true
-
-  #     # - name: Set up Python 3.10
-  #     #   uses: actions/setup-python@v4
-  #     #   with:
-  #     #     python-version: "3.10"
-  #     #     cache: 'pip'
-
-  #     - name: Install
-  #       # shell: bash -l {0}
-  #       run: |
-  #         echo "Running!"
-  #         pip install asv
-  #         asv machine --yes
-  #         asv run
-  #       # asv continuous base pr --strict -e
-  #       # run: source continuous_integration/scripts/install.sh
-
-
-      # wget https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh -O ~/miniconda.sh
-      # bash ~/miniconda.sh -b -p $HOME/miniconda
-      # - name: Install test requirements
-      #   shell: bash -l {0}
-      #   run: |
-      #     set -vxeuo pipefail
-      #     python -m pip install .[dev]
-      #     python -m pip list
-
-      # - name: Start LDAP service in container.
-      #   shell: bash -l {0}
-      #   run: source continuous_integration/scripts/start_LDAP.sh
-
-      # - name: Download SQLite example data.
-      #   shell: bash -l {0}
-      #   run: source continuous_integration/scripts/download_sqlite_data.sh
-
-      # - name: Start PostgreSQL service in container.
-      #   shell: bash -l {0}
-      #   run: source continuous_integration/scripts/start_postgres.sh
-
-      # - run: pip install asv virtualenv libmambapy conda
-      # - run: asv machine --yes
-      # - run: asv continuous base pr --strict -e
-
-  # checks:
-
-  #   runs-on: ubuntu-latest
-
-  #   steps:
-  #     - uses: actions/checkout@v3
-
-  #     - name: Set up Python 3.10
-  #       uses: actions/setup-python@v4
-  #       with:
-  #         python-version: "3.10"
-  #         cache: 'pip'
-
-  #     - name: Install
-  #       shell: bash -l {0}
-  #       run: source continuous_integration/scripts/install.sh
-
-  #     - name: Install test requirements
-  #       shell: bash -l {0}
-  #       run: |
-  #         set -vxeuo pipefail
-  #         python -m pip install .[dev]
-  #         python -m pip list
-
-  #     - name: Start LDAP service in container.
-  #       shell: bash -l {0}
-  #       run: source continuous_integration/scripts/start_LDAP.sh
-
-  #     - name: Download SQLite example data.
-  #       shell: bash -l {0}
-  #       run: source continuous_integration/scripts/download_sqlite_data.sh
-
-  #     - name: Start PostgreSQL service in container.
-  #       shell: bash -l {0}
-  #       run: source continuous_integration/scripts/start_postgres.sh
-
-
-  #     - name: Ensure example data is migrated to current catalog database schema.
-  #       # The example data is expected to be kept up to date to the latest Tiled
-  #       # release, but this CI run may include some unreleased schema changes,
-  #       # so we run a migration here.
-  #       shell: bash -l {0}
-  #       run: |
-  #         set -vxeuo pipefail
-  #         tiled catalog upgrade-database sqlite+aiosqlite:///tiled_test_db_sqlite.db
-  #         tiled catalog upgrade-database postgresql+asyncpg://postgres:secret@localhost:5432/tiled-example-data
-
-  #     - name: Test with pytest
-  #       shell: bash -l {0}
-  #       run: |
-  #         set -vxeuo pipefail
-  #         coverage run -m pytest -v
-  #         coverage report
-  #       env:
-  #         # Provide test suite with a PostgreSQL database to use.
-  #         TILED_TEST_POSTGRESQL_URI: postgresql+asyncpg://postgres:secret@localhost:5432
-  #         # Opt in to LDAPAuthenticator tests.
-  #         TILED_TEST_LDAP: 1
