@@ -33,7 +33,8 @@
 
     // List of branches to benchmark. If not provided, defaults to "master"
     // (for git) or "default" (for mercurial).
-    "branches": ["main"], // for git
+    "branches": ["benchmarks"], // for git
+    // "branches": ["main", "asv"], // for git
     // "branches": ["default"],    // for mercurial
 
     // The DVCS being used.  If not set, it will be automatically
@@ -85,8 +86,7 @@
     //    "pydantic": [""],
     //    "uvicorn": [""],
     //    "numpy": [""]},
-
-         //     "six": ["", null],        // test with and without six installed
+    //     "six": ["", null],        // test with and without six installed
     //     "pip+emcee": [""],   // emcee is only available for install with pip.
     // },
 
