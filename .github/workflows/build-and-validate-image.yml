@@ -94,6 +94,14 @@ jobs:
           miniforge-version: "latest"
           # activate-environment: asv-bench
 
+      - name: Install asv
+        shell: bash -l {0}
+        run: |
+          conda info
+          conda list
+          echo "Installing ASV"
+          python -m pip install asv
+
       # - name: Cache environment
       #   uses: actions/cache@v4
       #   with:
