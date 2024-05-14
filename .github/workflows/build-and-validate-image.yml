@@ -137,14 +137,15 @@ jobs:
             cp -r tiled-benchmarks/results .asv/results/
           fi
 
-      - name: Run benchmarks
-        id: benchmark
-        run: |
-          asv machine --machine GH-Actions --os ubuntu-latest --arch x64 --cpu "2-core unknown" --ram 7GB
-          asv run --skip-existing --parallel || true
+      # - name: Run benchmarks
+      #   id: benchmark
+      #   run: |
+      #     asv machine --machine GH-Actions --os ubuntu-latest --arch x64 --cpu "2-core unknown" --ram 7GB
+      #     asv run --skip-existing --parallel || true
 
       - name: Commit and push benchmark results
         run: |
+          echo "test" >> tiled-benchmarks/results/test.txt
           if [ -d "tiled-benchmarks/results" ]; then
             rm -r tiled-benchmarks/results
           fi
