@@ -153,9 +153,11 @@ jobs:
           fi
           # cp -r .asv/results/ tiled-benchmarks/
           cd tiled-benchmarks
+          ls -all
+          git status
           git config --local user.email "ymatviych@bnl.gov"
           git config --local user.name "ymatviych"
-          git add results
+          git add results/*
           git commit -m "[🤖] Update benchmark results"
 
       - name: Push to tiled-benchmarks
