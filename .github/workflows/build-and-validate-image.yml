@@ -155,14 +155,16 @@ jobs:
           cp -r .asv/results/ tiled-benchmarks/
           cd tiled-benchmarks
           ls -all
+          ls results -all
           git status
           git config --local user.email "ymatviych@bnl.gov"
           git config --local user.name "ymatviych"
           git add results/*
           git commit -m "[🤖] Update benchmark results"
+          git status
 
       - name: Push to tiled-benchmarks
-        if: github.ref == 'refs/heads/main' && github.repository == 'genematx/tiled-benchmarks'
+        # if: github.ref == 'refs/heads/main' && github.repository == 'genematx/tiled-benchmarks'
         uses: ad-m/github-push-action@master
         with:
           github_token: ${{ secrets.REPO_PAT }}
