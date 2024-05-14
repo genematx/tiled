@@ -136,6 +136,7 @@ jobs:
           if [ -d "tiled-benchmarks/results" ]; then
             cp -r tiled-benchmarks/results .asv/results/
           else
+            mkdir .asv
             mkdir .asv/results
             echo "test" >> .asv/results/test.txt
           fi
