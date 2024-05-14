@@ -135,17 +135,13 @@ jobs:
         run: |
           if [ -d "tiled-benchmarks/results" ]; then
             cp -r tiled-benchmarks/results .asv/results/
-          else
-            mkdir .asv
-            mkdir .asv/results
-            echo "test" >> .asv/results/test.txt
           fi
 
-      # - name: Run benchmarks
-      #   id: benchmark
-      #   run: |
-      #     asv machine --machine GH-Actions --os ubuntu-latest --arch x64 --cpu "2-core unknown" --ram 7GB
-      #     asv run --skip-existing --parallel || true
+      - name: Run benchmarks
+        id: benchmark
+        run: |
+          asv machine --machine GH-Actions --os ubuntu-latest --arch x64 --cpu "2-core unknown" --ram 7GB
+          asv run --skip-existing --parallel || true
 
       - name: Commit and push benchmark results
         run: |
@@ -154,14 +150,10 @@ jobs:
           fi
           cp -r .asv/results/ tiled-benchmarks/
           cd tiled-benchmarks
-          ls -all
-          ls results -all
-          git status
           git config --local user.email "ymatviych@bnl.gov"
           git config --local user.name "ymatviych"
-          git add results/*
+          git add results
           git commit -m "[🤖] Update benchmark results"
-          git status
 
       - name: Push to tiled-benchmarks
         # if: github.ref == 'refs/heads/main' && github.repository == 'genematx/tiled-benchmarks'
