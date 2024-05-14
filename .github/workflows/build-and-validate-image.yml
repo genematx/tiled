@@ -135,6 +135,9 @@ jobs:
         run: |
           if [ -d "tiled-benchmarks/results" ]; then
             cp -r tiled-benchmarks/results .asv/results/
+          else
+            mkdir tiled-benchmarks/results
+            echo "test" >> tiled-benchmarks/results/test.txt
           fi
 
       # - name: Run benchmarks
@@ -145,7 +148,6 @@ jobs:
 
       - name: Commit and push benchmark results
         run: |
-          echo "test" >> tiled-benchmarks/results/test.txt
           if [ -d "tiled-benchmarks/results" ]; then
             rm -r tiled-benchmarks/results
           fi
