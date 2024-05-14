@@ -151,7 +151,7 @@ jobs:
           if [ -d "tiled-benchmarks/results" ]; then
             rm -r tiled-benchmarks/results
           fi
-          cp -r .asv/results/ tiled-benchmarks/
+          # cp -r .asv/results/ tiled-benchmarks/
           cd tiled-benchmarks
           git config --local user.email "ymatviych@bnl.gov"
           git config --local user.name "ymatviych"
