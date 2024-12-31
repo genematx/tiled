@@ -61,6 +61,7 @@ from .dependencies import (
 )
 from .file_response_with_range import FileResponseWithRange
 from .links import links_for_node
+from .pydantic_composite import CompositeStructure
 from .pydantic_consolidated import ConsolidatedStructure
 from .settings import get_settings
 from .utils import filter_for_access, get_base_url, record_timing
@@ -175,7 +176,10 @@ async def search(
     **filters,
 ):
     request.state.endpoint = "search"
-    if entry.structure_family != StructureFamily.container:
+    if entry.structure_family not in (
+        StructureFamily.container,
+        StructureFamily.composite,
+    ):
         raise WrongTypeForRoute("This is not a Node; it cannot be searched or listed.")
     entry = filter_for_access(
         entry, principal, ["read:metadata"], request.state.metrics
@@ -344,7 +348,7 @@ async def metadata(
             select_metadata,
             omit_links,
             include_data_sources,
-            resolve_media_type(request),
+            media_type=resolve_media_type(request),
             max_depth=max_depth,
         )
     except JMESPathError as err:
@@ -1162,6 +1166,8 @@ async def _create_node(
     metadata_modified = False
     if structure_family == StructureFamily.consolidated:
         structure = ConsolidatedStructure.from_data_sources(body.data_sources)
+    if structure_family == StructureFamily.composite:
+        structure = CompositeStructure(contents=None, count=None)
     elif body.data_sources:
         assert len(body.data_sources) == 1  # more not yet implemented
         structure = body.data_sources[0].structure
