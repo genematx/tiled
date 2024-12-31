@@ -101,6 +101,13 @@ def SecureEntry(scopes, structure_families=None):
                         entry = entry[segment]
                     except (KeyError, TypeError):
                         raise NoEntry(path_parts)
+
+            # Handle part in Composite structure family
+            if (entry.structure_family == StructureFamily.composite) and part:
+                entry = await entry.lookup_adapter([part])
+                if entry is None:
+                    raise NoEntry(path_parts + part)
+
             # Now check that we have the requested scope on the final node.
             access_policy = getattr(entry, "access_policy", None)
             if access_policy is not None:
@@ -127,11 +134,13 @@ def SecureEntry(scopes, structure_families=None):
             raise HTTPException(
                 status_code=HTTP_404_NOT_FOUND, detail=f"No such entry: {path_parts}"
             )
+
         # Fast path for the common successful case
         if (structure_families is None) or (
             entry.structure_family in structure_families
         ):
             return entry
+
         # Handle consolidated structure_family
         if entry.structure_family == StructureFamily.consolidated:
             if not part:
