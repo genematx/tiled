@@ -125,22 +125,6 @@ def SecureEntry(scopes, structure_families=None):
 
             # Now check that we have the requested scope on the final node.
             access_policy = getattr(entry, "access_policy", None)
-                    
-            # if getattr(entry, "access_policy", None) is not None:
-            #     path_parts_relative = path_parts[i + 1 :]  # noqa: E203
-            #     entry_with_access_policy = entry
-            #     # filter and keep only what we are allowed to see from here
-            #     entry = await filter_for_access(
-            #         entry,
-            #         principal,
-            #         ["read:metadata"],
-            #         request.state.metrics,
-            #         path_parts_relative,
-            #     )
-
-            # # Now check that we have the requested scope according to the discovered access policy
-            # access_policy = getattr(entry_with_access_policy, "access_policy", None)
-
             if access_policy is not None:
                 with record_timing(request.state.metrics, "acl"):
                     allowed_scopes = await access_policy.allowed_scopes(
