@@ -3,7 +3,7 @@ import inspect
 import os
 import re
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, List, Optional
@@ -152,7 +152,7 @@ async def about(
             },
             meta={"root_path": request.scope.get("root_path") or "" + "/api"},
         ).model_dump(),
-        expires=datetime.utcnow() + timedelta(seconds=600),
+        expires=datetime.now(timezone.utc) + timedelta(seconds=600),
     )
 
 
@@ -1738,7 +1738,6 @@ async def get_asset(
     return FileResponseWithRange(
         full_path,
         stat_result=stat_result,
-        method="GET",
         status_code=status_code,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         range=range,
