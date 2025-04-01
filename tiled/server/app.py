@@ -804,6 +804,38 @@ Back up the database, and then run:
             # An exception above would have triggered an early exit.
             return response
 
+    if True:
+    # if app.settings.PROFILING_ENABLED is True:
+
+        from pyinstrument import Profiler
+        from pyinstrument.renderers.html import HTMLRenderer
+        from pyinstrument.renderers.speedscope import SpeedscopeRenderer
+
+        @app.middleware("http")
+        async def profile_request(request: Request, call_next):
+            """Profile the current request
+
+            References:
+            https://blog.balthazar-rouberol.com/how-to-profile-a-fastapi-asynchronous-request
+            https://pyinstrument.readthedocs.io/en/latest/guide.html#profile-a-web-request-in-fastapi
+
+            """
+            profile_type_to_ext = {"html": "html", "speedscope": "speedscope.json"}
+            profile_type_to_renderer = {
+                "html": HTMLRenderer,
+                "speedscope": SpeedscopeRenderer,
+            }
+            if request.query_params.get("profile", False):
+                profile_type = request.query_params.get("profile_format", "speedscope")
+                with Profiler(interval=0.001, async_mode="enabled") as profiler:
+                    response = await call_next(request)
+                extension = profile_type_to_ext[profile_type]
+                renderer = profile_type_to_renderer[profile_type]()
+                with open(f"profile.{extension}", "w") as out:
+                    out.write(profiler.output(renderer=renderer))
+                return response
+            return await call_next(request)
+
     @app.middleware("http")
     async def current_principal_logging_filter(request: Request, call_next):
         request.state.principal = SpecialUsers.public
