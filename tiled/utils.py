@@ -731,8 +731,8 @@ def path_from_uri(uri) -> Path:
     elif parsed.scheme in {"sqlite", "duckdb"}:
         # The path begins after the third slash.
         path = Path(parsed.path[1:])
-    elif parsed.scheme == "postgresql":
-        path = Path(parsed.path)
+    # elif parsed.scheme == "postgresql":
+    #     path = Path(parsed.path)
     else:
         raise ValueError(
             "Supported schemes are 'file', 'sqlite', 'duckdb', and 'postgresql'. "
