@@ -13,7 +13,12 @@ from tiled.adapters.sql import (
     arrow_schema_to_column_defns,
     arrow_schema_to_create_table,
     create_connection,
+    SQLAdapter,
 )
+from tiled.storage import parse_storage, register_storage
+from tiled.structures.core import StructureFamily
+from tiled.structures.data_source import DataSource, Management
+from tiled.structures.table import TableStructure
 
 
 @pytest_asyncio.fixture
@@ -156,6 +161,18 @@ TEST_CASES = {
             "postgresql": (
                 ["INTEGER ARRAY NULL"],
                 pa.schema([("x", pa.list_(pa.int32()))]),
+            ),
+        },
+    ),
+    "long_list_of_ints": (
+        pa.Table.from_arrays(
+            [pa.array([range(1024), range(1024, 2048)], pa.list_(pa.int64()))], names=["x"]
+        ),
+        {
+            "duckdb": (["INTEGER[] NULL"], pa.schema([("x", pa.list_(pa.int64()))])),
+            "postgresql": (
+                ["INTEGER ARRAY NULL"],
+                pa.schema([("x", pa.list_(pa.int64()))]),
             ),
         },
     ),

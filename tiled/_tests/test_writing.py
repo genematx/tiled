@@ -5,13 +5,14 @@ Persistent stores are being developed externally to the tiled package.
 """
 import base64
 from datetime import datetime
+import decimal
 
 import awkward
 import dask.dataframe
 import numpy
 import pandas
 import pandas.testing
-import pyarrow
+import pyarrow as pa
 import pytest
 import sparse
 from pandas.testing import assert_frame_equal
@@ -35,6 +36,7 @@ from ..structures.table import TableStructure
 from ..utils import APACHE_ARROW_FILE_MIME_TYPE, patch_mimetypes
 from ..validation_registration import ValidationRegistry
 from .utils import fail_with_status_code
+from ..storage import parse_storage, register_storage
 
 validation_registry = ValidationRegistry()
 validation_registry.register("SomeSpec", lambda *args, **kwargs: None)
@@ -690,8 +692,8 @@ def test_append_partition(
 ):
     with Context.from_app(build_app(tree)) as context:
         client = from_context(context, include_data_sources=True)
-        orig_table = pyarrow.Table.from_pydict(orig_file)
-        table_to_append = pyarrow.Table.from_pydict(file_to_append)
+        orig_table = pa.Table.from_pydict(orig_file)
+        table_to_append = pa.Table.from_pydict(file_to_append)
 
         x = client.create_appendable_table(orig_table.schema, key="x")
         x.append_partition(orig_table, 0)
@@ -727,7 +729,7 @@ def test_create_table_with_custom_name(
     table_name: str,
     expected: str,
 ):
-    table = pyarrow.Table.from_arrays([[1, 2, 3]], ["column_name"])
+    table = pa.Table.from_arrays([[1, 2, 3]], ["column_name"])
     with Context.from_app(build_app(tree)) as context:
         client = from_context(context, include_data_sources=True)
         if isinstance(expected, type(pytest.raises(ValueError))):
@@ -737,6 +739,84 @@ def test_create_table_with_custom_name(
             x = client.create_appendable_table(table.schema, table_name=table_name)
             x.append_partition(table, 0)
             assert x.read()["column_name"].to_list() == [1, 2, 3]
+
+INT8_INFO = numpy.iinfo(numpy.int8)
+INT16_INFO = numpy.iinfo(numpy.int16)
+INT32_INFO = numpy.iinfo(numpy.int32)
+INT64_INFO = numpy.iinfo(numpy.int64)
+UINT8_INFO = numpy.iinfo(numpy.uint8)
+UINT16_INFO = numpy.iinfo(numpy.uint16)
+UINT32_INFO = numpy.iinfo(numpy.uint32)
+UINT64_INFO = numpy.iinfo(numpy.uint64)
+FLOAT16_INFO = numpy.finfo(numpy.float16)
+FLOAT32_INFO = numpy.finfo(numpy.float32)
+FLOAT64_INFO = numpy.finfo(numpy.float64)
+
+TEST_CASES = {
+    "bool": pa.Table.from_arrays([pa.array([True, False], "bool")], names=["x"]),
+    "string": pa.Table.from_arrays([pa.array(["a", "b"], "string")], names=["x"]),
+    "int8": pa.Table.from_arrays(
+            [pa.array([INT8_INFO.min, INT8_INFO.max], "int8")], names=["x"]
+        ),
+    "int16": pa.Table.from_arrays(
+            [pa.array([INT16_INFO.min, INT16_INFO.max], "int16")], names=["x"]
+        ),
+    "int32": pa.Table.from_arrays(
+            [pa.array([INT32_INFO.min, INT32_INFO.max], "int32")], names=["x"]
+        ),
+    "int64": pa.Table.from_arrays(
+            [pa.array([INT64_INFO.min, INT64_INFO.max], "int64")], names=["x"]
+        ),
+    "uint8": pa.Table.from_arrays(
+            [pa.array([UINT8_INFO.min, UINT8_INFO.max], "uint8")], names=["x"]
+        ),
+    "uint16": pa.Table.from_arrays(
+            [pa.array([UINT16_INFO.min, UINT16_INFO.max], "uint16")], names=["x"]
+        ),
+    "uint32": pa.Table.from_arrays(
+            [pa.array([UINT32_INFO.min, UINT32_INFO.max], "uint32")], names=["x"]
+        ),
+    "uint64": pa.Table.from_arrays(
+            [pa.array([UINT64_INFO.min, UINT64_INFO.max], "uint64")], names=["x"]
+        ),
+    "list_of_ints": pa.Table.from_arrays(
+            [pa.array([[1, 2], [3, 4]], pa.list_(pa.int32()))], names=["x"]
+        ),
+    "long_list_of_ints": pa.Table.from_arrays(
+            [pa.array([range(1024), range(1024, 2048)], pa.list_(pa.int64()))], names=["x"]
+        ),
+    "list_of_bounded_ints": pa.Table.from_arrays(
+            [pa.array([[1, 2], [3, 4]], pa.list_(pa.int32(), 2))], names=["x"]
+        ),
+    "float32": pa.Table.from_arrays(
+            [pa.array([FLOAT32_INFO.min, FLOAT32_INFO.max], "float32")], names=["x"]
+        ),
+    "float64": pa.Table.from_arrays(
+            [pa.array([FLOAT64_INFO.min, FLOAT64_INFO.max], "float64")], names=["x"]
+        ),
+    "decimal": pa.Table.from_arrays(
+            [pa.array([decimal.Decimal("123.45")], pa.decimal128(5, 2))], names=["x"]
+        )
+}
+
+
+# @pytest.mark.parametrize("test_case_id", list(TEST_CASES.keys()))
+@pytest.mark.parametrize("test_case_id", ["list_of_ints"])
+def test_write_sql_types(
+    tree,
+    test_case_id,
+):
+    table = TEST_CASES[test_case_id]
+    with Context.from_app(build_app(tree)) as context:
+        client = from_context(context)
+
+        x = client.create_appendable_table(table.schema)
+        x.append_partition(table, 0)
+        result = x.read()
+
+        assert table.schema[0].type.to_pandas_dtype() == result['x'].dtype
+
+        breakpoint()
 
 
 def test_composite_one_table(tree):

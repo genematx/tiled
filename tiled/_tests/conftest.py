@@ -152,15 +152,15 @@ async def duckdb_uri(tmp_path: Path):
 
 
 @pytest_asyncio.fixture
-async def postgres_uri():
+async def postgresql_uri():
     if not TILED_TEST_POSTGRESQL_URI:
         raise pytest.skip("No TILED_TEST_POSTGRESQL_URI configured")
     async with temp_postgres(TILED_TEST_POSTGRESQL_URI) as uri_with_database:
         yield uri_with_database
 
 
-@pytest.fixture(params=["sqlite_uri", "postgres_uri"])
-def sqlite_or_postgres_uri(request):
+@pytest.fixture(params=["sqlite_uri", "postgresql_uri"])
+def sqlite_or_postgresql_uri(request):
     yield request.getfixturevalue(request.param)
 
 

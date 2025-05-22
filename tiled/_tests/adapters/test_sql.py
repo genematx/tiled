@@ -161,9 +161,9 @@ def test_attributes_sql_many_part(adapter_sql_many_partitions: SQLAdapter) -> No
 @pytest.fixture
 def adapter_psql_one_partition(
     data_source_from_init_storage: Callable[[str, int], DataSource[TableStructure]],
-    postgres_uri: str,
+    postgresql_uri: str,
 ) -> Generator[SQLAdapter, None, None]:
-    data_source = data_source_from_init_storage(postgres_uri, 1)
+    data_source = data_source_from_init_storage(postgresql_uri, 1)
     adapter = SQLAdapter(
         data_source.assets[0].data_uri,
         data_source.structure,
@@ -177,9 +177,9 @@ def adapter_psql_one_partition(
 @pytest.fixture
 def adapter_psql_many_partitions(
     data_source_from_init_storage: Callable[[str, int], DataSource[TableStructure]],
-    postgres_uri: str,
+    postgresql_uri: str,
 ) -> SQLAdapter:
-    data_source = data_source_from_init_storage(postgres_uri, 3)
+    data_source = data_source_from_init_storage(postgresql_uri, 3)
     return SQLAdapter(
         data_source.assets[0].data_uri,
         data_source.structure,
@@ -637,7 +637,7 @@ def test_check_column_name_is_safe(column_name: str, expected: str) -> None:
         )
 
 
-@pytest.mark.parametrize("data_uri", ["sqlite_uri", "duckdb_uri", "postgres_uri"])
+@pytest.mark.parametrize("data_uri", ["sqlite_uri", "duckdb_uri", "postgresql_uri"])
 @pytest.mark.parametrize("column_name", ["a", "a b", "a-b", "a:b", "a*b", "a/b", "Ab"])
 def test_can_query_with_valid_column_names(
     data_uri: str, column_name: str, request: pytest.FixtureRequest
@@ -657,7 +657,7 @@ def test_can_query_with_valid_column_names(
     assert SQLAdapter.init_storage(data_source=data_source, storage=storage) is not None
 
 
-@pytest.mark.parametrize("data_uri", ["sqlite_uri", "duckdb_uri", "postgres_uri"])
+@pytest.mark.parametrize("data_uri", ["sqlite_uri", "duckdb_uri", "postgresql_uri"])
 def test_reject_colliding_uppercase_column_names(
     data_uri: str, request: pytest.FixtureRequest
 ) -> None:
