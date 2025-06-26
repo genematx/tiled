@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import anyio
 from fastapi import HTTPException
 from sqlalchemy import (
+    create_engine,
     delete,
     event,
     false,
@@ -301,28 +302,10 @@ class CatalogNodeAdapter:
     register_query = query_registry.register
     register_query_lazy = query_registry.register_lazy
 
-    def __init__(
-        self,
-        context,
-        node,
-        *,
-        conditions=None,
-        queries=None,
-        sorting=None,
-        mount_node: Union[str, List[str]] = "",
-    ):
+    def __init__(self, context, node, *, conditions=None, queries=None, sorting=None):
         self.context = context
         self.engine = self.context.engine
         self.node = node
-
-        if isinstance(mount_node, str):
-            mount_node = [segment for segment in mount_node.split("/") if segment]
-        if mount_node and not isinstance(node, RootNode):
-            # sanity-check -- this should not be reachable
-            raise RuntimeError("mount_node should only be passed with the RootNode")
-        self.mount_node = mount_node or []
-
-        self.key = self.mount_node[-1] if self.mount_node else self.node.key
         self.sorting = sorting or [("", 1)]
         self.order_by_clauses = order_by_clauses(self.sorting)
         self.conditions = conditions or []
@@ -452,24 +435,10 @@ class CatalogNodeAdapter:
             assert not first_level.conditions
             return await first_level.lookup_adapter(segments[1:])
 
-        # Query the database recursively to find the node with the given ancestors and key
-        # Create an alias for each ancestor node in the path and build the join chain
-        NodeAliases = [aliased(orm.Node) for _ in range(len(segments))] + [orm.Node]
-        statement = select(NodeAliases[-1])  # Select the child node
-        statement = statement.select_from(NodeAliases[0])  # Start from the ancestor
+        statement = node_from_segments(segments, root_id=self.node.id)
         statement = self.apply_conditions(statement)  # Conditions on the child node
-        statement = statement.where(NodeAliases[0].id == self.node.id)
-
-        for i, segment in enumerate(segments):
-            parent, child = NodeAliases[i], NodeAliases[i + 1]
-            statement = statement.join(child, child.parent == parent.id).where(
-                child.key == segment
-            )
-
         statement = statement.options(
-            selectinload(NodeAliases[-1].data_sources).selectinload(
-                orm.DataSource.structure
-            )
+            selectinload(orm.Node.data_sources).selectinload(orm.DataSource.structure)
         )
 
         async with self.context.session() as db:
@@ -955,6 +924,7 @@ class CatalogNodeAdapter:
                         )
                     )
                     .filter(condition)
+                    .distinct()
                 )
                 int_assets = (await db.execute(sel_int_asset_statement)).all()
                 for data_uri, is_directory in int_assets:
@@ -1590,6 +1560,21 @@ def from_uri(
         poolclass = AsyncAdaptedQueuePool
     else:
         poolclass = None  # defer to sqlalchemy default
+
+    node = RootNode(metadata, specs, top_level_access_blob)
+
+    if mount_node:
+        if isinstance(mount_node, str):
+            mount_node = [segment for segment in mount_node.split("/") if segment]
+        sync_uri = uri.replace("postgresql+asyncpg", "postgresql+psycopg2").replace(
+            "sqlite+aiosqlite", "sqlite"
+        )
+        sync_engine = create_engine(sync_uri)
+        statement = node_from_segments(mount_node).with_only_columns(orm.Node.id)
+        with sync_engine.connect() as conn:
+            node.id = conn.execute(statement).scalar()
+        node.key = mount_node[-1]
+
     engine = create_async_engine(
         uri,
         echo=echo,
@@ -1598,11 +1583,8 @@ def from_uri(
     )
     if engine.dialect.name == "sqlite":
         event.listens_for(engine.sync_engine, "connect")(_set_sqlite_pragma)
-    adapter = CatalogContainerAdapter(
-        Context(engine, writable_storage, readable_storage, adapters_by_mimetype),
-        RootNode(metadata, specs, top_level_access_blob),
-        mount_node=mount_node,
-    )
+    context = Context(engine, writable_storage, readable_storage, adapters_by_mimetype)
+    adapter = CatalogContainerAdapter(context, node)
     return adapter
 
 
@@ -1679,6 +1661,38 @@ def specs_array_to_json(specs):
     [{"name":"foo"},{"name":"bar"}]
     """
     return [{"name": spec} for spec in specs]
+
+
+def node_from_segments(segments, root_id=0):
+    """Create an SQLAlchemy select statement to find a node based on its path
+
+    Queries the database recursively to find the node with the given ancestors
+    and key.
+
+    Parameters
+    ----------
+        segments : list of str
+            The path segments leading to the node, e.g. ['A', 'x', 'i'].
+        root_id : int
+            The ID of the root node, typically 0 for the root of the catalog.
+
+    Returns
+    -------
+        sqlalchemy.sql.selectable.Select
+    """
+
+    # Create an alias for each ancestor node in the path and build the join chain
+    orm_NodeAliases = [aliased(orm.Node) for _ in range(len(segments))] + [orm.Node]
+    statement = select(orm_NodeAliases[-1])  # Select the child node
+    statement = statement.select_from(orm_NodeAliases[0])  # Start from the ancestor
+    statement = statement.where(orm_NodeAliases[0].id == root_id)
+    for i, segment in enumerate(segments):
+        parent, child = orm_NodeAliases[i], orm_NodeAliases[i + 1]
+        statement = statement.join(child, child.parent == parent.id).where(
+            child.key == segment
+        )
+
+    return statement
 
 
 STRUCTURES = {
