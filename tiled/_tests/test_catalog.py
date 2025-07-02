@@ -371,7 +371,7 @@ async def test_delete_tree(tmpdir):
 
 
 @pytest.mark.asyncio
-async def test_delete_subtree(tmpdir):
+async def test_delete_with_external_nodes(tmpdir):
     # Do not use client fixture here.
     # The Context must be opened inside the test or we run into
     # event loop crossing issues with the Postgres test.
@@ -441,7 +441,8 @@ async def test_delete_sql_assets(tmpdir, scheme):
     # Do not use client fixture here.
     # The Context must be opened inside the test or we run into
     # event loop crossing issues with the Postgres test.
-    tree = in_memory(writable_storage={"sql": f"{scheme}:///{tmpdir / 'storage.db'}"})
+    sql_storage_uri = f"{scheme}:///{tmpdir / 'storage.db'}"
+    tree = in_memory(writable_storage={"sql": sql_storage_uri})
 
     # Create some tables to write
     table_1 = pyarrow.Table.from_pydict({"a": [1, 2, 3], "b": [4.0, 5.0, 6.0]})

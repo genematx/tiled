@@ -1156,11 +1156,15 @@ def delete_asset(data_uri, is_directory, parameters=None):
             cursor.execute(
                 f'DELETE FROM "{table_name}" WHERE _dataset_id = ?;', (dataset_id,)
             )
+        conn.commit()
+        # If the table is empty, we can drop it
+        with conn.cursor() as cursor:
             cursor.execute(f'SELECT COUNT(*) FROM "{table_name}";')
             if cursor.fetchone()[0] == 0:
-                # If the table is empty, we can drop it
                 cursor.execute(f'DROP TABLE IF EXISTS "{table_name}";')
-        conn.commit()
+        if url.scheme != "duckdb":
+            conn.commit()  # DuckDB has implicit commits on DROP TABLE
+        conn.close()
     else:
         raise NotImplementedError(
             f"Cannot delete asset at {data_uri!r} because the scheme {url.scheme!r} is not supported."
