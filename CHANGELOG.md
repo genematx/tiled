@@ -3,6 +3,13 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The logic of hierarchical organization of the Nodes table in Catalog: use the concept
+  of Closure Table to track ancestors and descendands of the nodes.
+
 ## v0.1.0-b29 (2025-06-06)
 
 ### Added
