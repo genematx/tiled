@@ -3,15 +3,23 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 # Changelog
 
+
 ## v0.1.0-b31 (Unreleased)
 
 ### Added
 
 - Pooling of ADBC connections to storage databases.
 
+### Changed
+
+- The logic of hierarchical organization of the Nodes table in Catalog: use the concept
+  of Closure Table to track ancestors and descendands of the nodes.
+- Added a node_id index to the data_sources table.
+
 ### Fixed
 
 - Tests were missing assertions to verify expected outcomes
+
 
 ## v0.1.0-b30 (2025-07-18)
 

@@ -1521,6 +1521,16 @@ def get_router(
     async def delete(
         request: Request,
         path: str,
+        recursive: Optional[bool] = Query(
+            False, description="Delete children recursively"
+        ),
+        external_only: Optional[bool] = Query(
+            True,
+            description=(
+                "Delete the node, but only if this would not "
+                "affect any internally-managed data sources"
+            ),
+        ),
         principal: Union[Principal, SpecialUsers] = Depends(get_current_principal),
         root_tree: pydantic_settings.BaseSettings = Depends(get_root_tree),
         session_state: dict = Depends(get_session_state),
@@ -1539,7 +1549,7 @@ def get_router(
             getattr(request.app.state, "access_policy", None),
         )
         if hasattr(entry, "delete"):
-            await entry.delete()
+            await entry.delete(recursive=recursive, external_only=external_only)
         else:
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
@@ -1548,7 +1558,7 @@ def get_router(
         return json_or_msgpack(request, None)
 
     @router.delete("/nodes/{path:path}")
-    async def bulk_delete(
+    async def delete_tree(
         request: Request,
         path: str,
         principal: Union[Principal, SpecialUsers] = Depends(get_current_principal),
@@ -1568,12 +1578,12 @@ def get_router(
             None,
             getattr(request.app.state, "access_policy", None),
         )
-        if hasattr(entry, "delete_tree"):
-            await entry.delete_tree()
+        if hasattr(entry, "delete"):
+            await entry.delete(recursive=True, external_only=False)
         else:
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
-                detail="This node does not support bulk deletion.",
+                detail="This node does not support deletion.",
             )
         return json_or_msgpack(request, None)
 
@@ -1958,7 +1968,7 @@ def get_router(
             drop_revision=drop_revision,
         )
 
-        response_data = {"id": entry.key}
+        response_data = {"id": entry.node.key}
         if metadata_modified:
             response_data["metadata"] = metadata
         if access_blob_modified:
@@ -2040,7 +2050,7 @@ def get_router(
             drop_revision=drop_revision,
         )
 
-        response_data = {"id": entry.key}
+        response_data = {"id": entry.node.key}
         if metadata_modified:
             response_data["metadata"] = metadata
         if access_blob_modified:
