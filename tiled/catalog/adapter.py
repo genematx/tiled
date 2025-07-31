@@ -59,7 +59,6 @@ from tiled.queries import (
     StructureFamilyQuery,
 )
 
-from ..adapters.sql import create_connection
 from ..mimetypes import (
     APACHE_ARROW_FILE_MIME_TYPE,
     AWKWARD_BUFFERS_MIMETYPE,
@@ -72,7 +71,7 @@ from ..mimetypes import (
 from ..query_registration import QueryTranslationRegistry
 from ..server.core import NoEntry
 from ..server.schemas import Asset, DataSource, Management, Revision, Spec
-from ..storage import FileStorage, parse_storage, register_storage
+from ..storage import FileStorage, parse_storage, register_storage, get_storage
 from ..structures.core import StructureFamily
 from ..utils import (
     UNCHANGED,
@@ -1148,7 +1147,7 @@ def delete_asset(data_uri, is_directory, parameters=None):
         else:
             Path(path).unlink()
     elif url.scheme in {"duckdb", "sqlite"}:
-        conn = create_connection(data_uri)
+        conn = get_storage(data_uri).connect()
         table_name = parameters.get("table_name") if parameters else None
         dataset_id = parameters.get("dataset_id") if parameters else None
         with conn.cursor() as cursor:
