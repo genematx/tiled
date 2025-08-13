@@ -1,6 +1,8 @@
 import collections
 import gzip
+import inspect
 import mimetypes
+import warnings
 from collections import defaultdict
 
 from .utils import (
@@ -97,7 +99,9 @@ class SerializationRegistry:
             If there is not standard name, use "application/x-INVENT-NAME-HERE".
         func : callable, optional
             Should accept the relevant structure as input (e.g. a numpy array)
-            and return bytes or memoryview
+            and return bytes or memoryview.
+            The full expected signature is:
+            `func(mimetype: str, data: Any, metadata: dict, filter_for_access) -> bytes`
 
         Examples
         --------
@@ -129,6 +133,30 @@ class SerializationRegistry:
         if func is None:
             # Return a decorator
             return dec
+
+        # Check the signature of the function for backcompatibility
+        if len(inspect.signature(func).parameters) == 3:
+            # Old signature that didn't include the mimetype
+            # Replace the function with the new one that includes the mimetype
+            old_func = func
+
+            def func(mimetype, data, metadata, filter_for_access):
+                return old_func(data, metadata, filter_for_access)
+
+            warnings.warn(
+                "The serializer function signature has changed. "
+                "It now expects a `mimetype` argument: "
+                "func(mimetype: str, data: Any, metadata: dict, filter_for_access) -> bytes. "  # noqa
+                "The old signature is deprecated and will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        elif len(inspect.signature(func).parameters) != 4:
+            raise ValueError(
+                "The serializer function must accept 4 arguments: "
+                "mimetype, data, metadata, filter_for_access"
+            )
+
         return dec(func)
 
     def register_alias(self, ext, media_type):
