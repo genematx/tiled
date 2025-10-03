@@ -13,6 +13,7 @@ maintainers = [
   { name = "Brookhaven National Laboratory", email = "dallan@bnl.gov" },
 ]
 requires-python = ">=3.9"
+version = "0.1.5"
 
 # Dependencies common to both server and client; additional dependencies are
 # available depending on whether you are running client/server/both, and what
@@ -43,7 +44,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Physics",
 ]
 
-dynamic = ["version"]
+#dynamic = ["version"]
 
 [project.scripts]
 tiled = "tiled.commandline.main:main"
