@@ -10,6 +10,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
     cast,
@@ -27,6 +28,7 @@ from ..queries import (
     Eq,
     FullText,
     In,
+    KeyPresent,
     KeysFilter,
     NotEq,
     NotIn,
@@ -36,11 +38,12 @@ from ..queries import (
 )
 from ..query_registration import QueryTranslationRegistry
 from ..server.schemas import SortingItem
+from ..storage import Storage
 from ..structures.core import Spec, StructureFamily
 from ..structures.table import TableStructure
 from ..type_aliases import JSON
 from ..utils import UNCHANGED, Sentinel
-from .protocols import AccessPolicy, AnyAdapter
+from .protocols import AnyAdapter
 from .utils import IndexersMixin
 
 
@@ -50,7 +53,6 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
     """
 
     __slots__ = (
-        "_access_policy",
         "_mapping",
         "_metadata",
         "_sorting",
@@ -63,6 +65,7 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
     )
 
     structure_family = StructureFamily.container
+    supported_storage: Set[type[Storage]] = set()
 
     # Define classmethods for managing what queries this Adapter knows.
     query_registry = QueryTranslationRegistry()
@@ -77,7 +80,6 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
         metadata: Optional[JSON] = None,
         sorting: Optional[List[SortingItem]] = None,
         specs: Optional[List[Spec]] = None,
-        access_policy: Optional[AccessPolicy] = None,
         entries_stale_after: Optional[timedelta] = None,
         metadata_stale_after: Optional[timedelta] = None,
         must_revalidate: bool = True,
@@ -92,7 +94,6 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
         specs : List[str], optional
         sorting : List[Tuple[str, int]], optional
         specs : List[str], optional
-        access_policy : AccessPolicy, optional
         entries_stale_after: timedelta
             This server uses this to communicate to the client how long
             it should rely on a local cache before checking back for changes.
@@ -115,7 +116,6 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
         self._sorting = sorting
         self._metadata = metadata or {}
         self.specs = specs or []
-        self._access_policy = access_policy
         self._must_revalidate = must_revalidate
         self.include_routers: List[APIRouter] = []
         self.background_tasks: List[Any] = []
@@ -147,30 +147,6 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
 
         """
         self._must_revalidate = value
-
-    @property
-    def access_policy(self) -> Optional[AccessPolicy]:
-        """
-
-        Returns
-        -------
-
-        """
-        return self._access_policy
-
-    @access_policy.setter
-    def access_policy(self, value: AccessPolicy) -> None:
-        """
-
-        Parameters
-        ----------
-        value :
-
-        Returns
-        -------
-
-        """
-        self._access_policy = value
 
     def metadata(self) -> JSON:
         "Metadata about this Adapter."
@@ -329,7 +305,6 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
             sorting=cast(List[SortingItem], sorting),
             metadata=cast(JSON, self._metadata),
             specs=self.specs,
-            access_policy=self.access_policy,
             entries_stale_after=self.entries_stale_after,
             metadata_stale_after=self.entries_stale_after,
             must_revalidate=cast(bool, must_revalidate),
@@ -435,7 +410,7 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
                 )
 
             if direction < 0:
-                # TODO In Python 3.8 dict items should be reservible
+                # TODO In Python 3.8 dict items should be reversible
                 # but I have seen errors in the wild that I could not
                 # quickly resolve so for now we convert to list in the middle.
                 to_reverse = list(mapping.items())
@@ -446,7 +421,7 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
     # The following two methods are used by keys(), values(), items().
 
     def _keys_slice(
-        self, start: int, stop: int, direction: int
+        self, start: int, stop: int, direction: int, page_size: Optional[int] = None
     ) -> Union[Iterator[str], List[str]]:
         """
 
@@ -476,7 +451,7 @@ class MapAdapter(Mapping[str, AnyAdapter], IndexersMixin):
             return keys
 
     def _items_slice(
-        self, start: int, stop: int, direction: int
+        self, start: int, stop: int, direction: int, page_size: Optional[int] = None
     ) -> Iterator[Tuple[str, Any]]:
         """
 
@@ -777,6 +752,28 @@ def notin(query: Any, tree: MapAdapter) -> MapAdapter:
 
 
 MapAdapter.register_query(NotIn, notin)
+
+
+def key_present(query: Any, tree: MapAdapter) -> MapAdapter:
+    """
+
+    Parameters
+    ----------
+    query :
+    tree :
+
+    Returns
+    -------
+
+    """
+    matches = {}
+    for key, value, term in iter_child_metadata(query.key, tree):
+        if term in query.key:
+            matches[key] = value
+    return tree.new_variation(mapping=matches)
+
+
+MapAdapter.register_query(KeyPresent, key_present)
 
 
 def specs(query: Any, tree: MapAdapter) -> MapAdapter:

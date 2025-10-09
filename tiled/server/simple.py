@@ -7,10 +7,13 @@ import shutil
 import tempfile
 import threading
 import time
-from typing import Optional, Union
+from typing import Optional, Union, cast
 from urllib.parse import quote_plus, urlparse
 
 import uvicorn
+
+from ..storage import SQLStorage, get_storage
+from ..utils import ensure_uri
 
 _server_is_running = False
 
@@ -57,7 +60,7 @@ class SimpleTiledServer:
     Parameters
     ----------
     directory : Optional[Path, str]
-        Location where data and embedded databases will be stored. By
+        Location where data and embedded databases will be stored.
         By default, a temporary directory will be used.
     api_key : Optional[str]
         By default, an 8-bit random secret is generated. (Production Tiled
@@ -90,9 +93,11 @@ class SimpleTiledServer:
         directory: Optional[Union[str, pathlib.Path]] = None,
         api_key: Optional[str] = None,
         port: int = 0,
+        readable_storage: Optional[Union[str, pathlib.Path]] = None,
     ):
         # Delay import to avoid circular import.
         from ..catalog import from_uri as catalog_from_uri
+        from ..config import Authentication
         from .app import build_app
         from .logging_config import LOGGING_CONFIG
 
@@ -100,9 +105,11 @@ class SimpleTiledServer:
             directory = pathlib.Path(tempfile.mkdtemp())
             self._cleanup_directory = True
         else:
-            directory = pathlib.Path(directory)
+            directory = pathlib.Path(directory).resolve()
             self._cleanup_directory = False
-        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "data").mkdir(parents=True, exist_ok=True)
+        storage_uri = ensure_uri(f"duckdb:///{str(directory / 'storage.duckdb')}")
+
         # In production we use a proper 32-bit token, but for brevity we
         # use just 8 here. This server only accepts connections on localhost
         # and is not intended for production use, so we think this is an
@@ -121,11 +128,12 @@ class SimpleTiledServer:
 
         self.catalog = catalog_from_uri(
             directory / "catalog.db",
-            writable_storage=directory / "data",
+            writable_storage=[directory / "data", storage_uri],
             init_if_not_exists=True,
+            readable_storage=readable_storage,
         )
         self.app = build_app(
-            self.catalog, authentication={"single_user_api_key": api_key}
+            self.catalog, authentication=Authentication(single_user_api_key=api_key)
         )
         self._cm = ThreadedServer(
             uvicorn.Config(self.app, port=port, loop="asyncio", log_config=log_config)
@@ -138,6 +146,7 @@ class SimpleTiledServer:
         # Stash attributes for easy introspection
         self.port = actual_port
         self.directory = directory
+        self.storage = cast(SQLStorage, get_storage(storage_uri))
         self.api_key = api_key
         self.uri = f"{base_url}/api/v1?api_key={quote_plus(api_key)}"
         self.web_ui_link = f"{base_url}?api_key={quote_plus(api_key)}"
@@ -159,6 +168,7 @@ class SimpleTiledServer:
 </table>"""
 
     def close(self):
+        self.storage.dispose()  # Close the connection to the storage DB
         self._cm.__exit__(None, None, None)
         if self._cleanup_directory and (platform.system() != "Windows"):
             # Windows cannot delete the logfiles because the global Python

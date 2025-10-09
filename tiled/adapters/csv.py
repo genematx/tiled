@@ -7,9 +7,10 @@ import dask.dataframe
 import pandas
 
 from ..catalog.orm import Node
+from ..storage import FileStorage, Storage
 from ..structures.array import ArrayStructure
 from ..structures.core import Spec, StructureFamily
-from ..structures.data_source import Asset, DataSource, Management, Storage
+from ..structures.data_source import Asset, DataSource, Management
 from ..structures.table import TableStructure
 from ..type_aliases import JSON
 from ..utils import ensure_uri, path_from_uri
@@ -21,6 +22,7 @@ class CSVAdapter:
     """Adapter for tabular data stored as partitioned text (csv) files"""
 
     structure_family = StructureFamily.table
+    supported_storage = {FileStorage}
 
     def __init__(
         self,
@@ -98,7 +100,7 @@ class CSVAdapter:
             list of assets with each element corresponding to individual partition files
         """
         data_source = copy.deepcopy(data_source)  # Do not mutate caller input.
-        data_uri = storage.get("filesystem") + "".join(
+        data_uri = storage.uri + "".join(
             f"/{quote_plus(segment)}" for segment in path_parts
         )
         directory = path_from_uri(data_uri)
@@ -116,34 +118,34 @@ class CSVAdapter:
         return data_source
 
     def append_partition(
-        self, data: Union[dask.dataframe.DataFrame, pandas.DataFrame], partition: int
+        self, partition: int, data: Union[dask.dataframe.DataFrame, pandas.DataFrame]
     ) -> None:
         """Append data to an existing partition
 
         Parameters
         ----------
-        data : dask.dataframe.DataFrame or pandas.DataFrame
-            data to be appended
         partition : int
             index of the partition to be appended to
-
+        data : dask.dataframe.DataFrame or pandas.DataFrame
+            data to be appended
         """
+
         uri = self._file_paths[partition]
         data.to_csv(uri, index=False, mode="a", header=False)
 
     def write_partition(
-        self, data: Union[dask.dataframe.DataFrame, pandas.DataFrame], partition: int
+        self, partition: int, data: Union[dask.dataframe.DataFrame, pandas.DataFrame]
     ) -> None:
         """Write data to a new partition or overwrite an existing one
 
         Parameters
         ----------
-        data : dask.dataframe.DataFrame or pandas.DataFrame
-            data to be appended
         partition : int
             index of the partition to be appended to
-
+        data : dask.dataframe.DataFrame or pandas.DataFrame
+            data to be appended
         """
+
         uri = self._file_paths[partition]
         data.to_csv(uri, index=False)
 
@@ -154,8 +156,8 @@ class CSVAdapter:
         ----------
         data : dask.dataframe.DataFrame or pandas.DataFrame
             data to be written
-
         """
+
         if self.structure().npartitions != 1:
             raise NotImplementedError
         uri = self._file_paths[0]

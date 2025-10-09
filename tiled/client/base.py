@@ -2,6 +2,7 @@ import time
 from copy import copy, deepcopy
 from dataclasses import asdict
 from pathlib import Path
+from typing import Dict, List, Union
 from urllib.parse import parse_qs, urlparse
 
 import json_merge_patch
@@ -15,7 +16,11 @@ from ..structures.core import STRUCTURE_TYPES, Spec, StructureFamily
 from ..structures.data_source import DataSource
 from ..utils import UNCHANGED, DictView, ListView, patch_mimetypes, safe_json_dump
 from .metadata_update import apply_update_patch
-from .utils import MSGPACK_MIME_TYPE, handle_error, retry_context
+from .utils import MSGPACK_MIME_TYPE, handle_error, normalize_specs, retry_context
+
+# TODO: Duplicated from  tiled.type_aliases to prevent importing numpy
+# After #1407 replace AnyAdapter with the BaseClass and remove this redefinition
+JSON_ITEM = Union[str, int, float, bool, Dict[str, "JSON_ITEM"], List["JSON_ITEM"]]
 
 
 class MetadataRevisions:
@@ -142,7 +147,7 @@ class BaseClient:
             # Allow the caller to optionally hand us a structure that is already
             # parsed from a dict into a structure dataclass.
             self._structure = structure
-        elif structure_family in {StructureFamily.container, StructureFamily.composite}:
+        elif structure_family == StructureFamily.container:
             self._structure = None
         else:
             structure_type = STRUCTURE_TYPES[attributes["structure_family"]]
@@ -213,10 +218,7 @@ class BaseClient:
                     )
                 ).json()
         self._item = content["data"]
-        if self.structure_family not in {
-            StructureFamily.container,
-            StructureFamily.composite,
-        }:
+        if self.structure_family != StructureFamily.container:
             structure_type = STRUCTURE_TYPES[self.structure_family]
             self._structure = structure_type.from_json(
                 self._item["attributes"]["structure"]
@@ -229,7 +231,7 @@ class BaseClient:
         return self._item
 
     @property
-    def metadata(self):
+    def metadata(self) -> DictView[str, JSON_ITEM]:
         "Metadata about this data source."
         # Ensure this is immutable (at the top level) to help the user avoid
         # getting the wrong impression that editing this would update anything
@@ -246,26 +248,46 @@ class BaseClient:
             context=self.context,
             structure_clients=self.structure_clients,
             node_path_parts=self._item["attributes"]["ancestors"],
+            include_data_sources=self._include_data_sources,
         )
 
     def metadata_copy(self):
         """
-        Generate a mutable copy of metadata and specs for validating metadata
-        (useful with update_metadata())
+        Generate a mutable copy of metadata, specs, and access_tags for
+        validating metadata (useful with update_metadata())
         """
         metadata = deepcopy(self._item["attributes"]["metadata"])
         specs = [Spec(**spec) for spec in self._item["attributes"]["specs"]]
-        return [metadata, specs]  # returning as list of mutable items
+        access_tags = deepcopy(self._item["attributes"]["access_blob"].get("tags", []))
+        return [
+            md for md in [metadata, specs, access_tags] if md is not None
+        ]  # returning as list of mutable items
 
     @property
-    def specs(self):
+    def specs(self) -> ListView[Spec]:
         "List of specifications describing the structure of the metadata and/or data."
         return ListView([Spec(**spec) for spec in self._item["attributes"]["specs"]])
+
+    @property
+    def access_blob(self) -> DictView[str, JSON_ITEM]:
+        "Authorization information about this node, in blob form"
+        access_blob = self._item["attributes"]["access_blob"]
+        if access_blob is None:
+            raise AttributeError("Node has no attribute 'access_blob'")
+        # Ensure this is immutable (at the top level) to help the user avoid
+        # getting the wrong impression that editing this would update anything
+        # persistent.
+        return DictView(access_blob)
 
     @property
     def uri(self):
         "Direct link to this entry"
         return self.item["links"]["self"]
+
+    @property
+    def path_parts(self):
+        "Location of node in tree, given as list of path segments."
+        return self._item["attributes"]["ancestors"] + [self._item["id"]]
 
     @property
     def structure_family(self):
@@ -446,7 +468,9 @@ class BaseClient:
         )
         return sorted(formats)
 
-    def update_metadata(self, metadata=None, specs=None):
+    def update_metadata(
+        self, metadata=None, specs=None, access_tags=None, *, drop_revision=False
+    ):
         """
         EXPERIMENTAL: Update metadata via a `dict.update`- like interface.
 
@@ -461,6 +485,11 @@ class BaseClient:
         specs : List[str], optional
             List of names that are used to label that the data and/or metadata
             conform to some named standard specification.
+        access_tags: List[str], optional
+            Server-specific authZ tags in list form, used to confer access to the node.
+        drop_revision : bool, optional
+            Replace current version without saving current version as a revision.
+            Use with caution.
 
         See Also
         --------
@@ -496,19 +525,19 @@ class BaseClient:
         >>> md['unwanted_key'] = DELETE_KEY
         >>> node.update_metadata(metadata=md)  # Update the copy on the server
         """
-        if isinstance(metadata, list) and len(metadata) == 2:
-            if specs is None:
-                # Likely [metadata, specs] form from node.metadata_copy()
-                metadata, specs = metadata
-            else:
-                raise ValueError("Duplicate specs provided after [metadata, specs]")
-
-        metadata_patch, specs_patch = self.build_metadata_patches(
-            metadata=metadata, specs=specs
+        metadata_patch, specs_patch, access_blob_patch = self.build_metadata_patches(
+            metadata=metadata,
+            specs=specs,
+            access_tags=access_tags,
         )
-        self.patch_metadata(metadata_patch=metadata_patch, specs_patch=specs_patch)
+        self.patch_metadata(
+            metadata_patch=metadata_patch,
+            specs_patch=specs_patch,
+            access_blob_patch=access_blob_patch,
+            drop_revision=drop_revision,
+        )
 
-    def build_metadata_patches(self, metadata=None, specs=None):
+    def build_metadata_patches(self, metadata=None, specs=None, access_tags=None):
         """
         Build valid JSON Patches (RFC6902) for metadata and metadata validation
         specs accepted by `patch_metadata`.
@@ -522,6 +551,9 @@ class BaseClient:
         specs : list[Spec], optional
             Metadata validation specifications.
 
+        access_tags: List[str], optional
+            Server-specific authZ tags in list form, used to confer access to the node.
+
         Returns
         -------
         metadata_patch : list[dict]
@@ -530,6 +562,9 @@ class BaseClient:
         specs_patch : list[dict]
             A JSON serializable object representing a valid JSON patch (RFC6902)
             for metadata validation specifications.
+        access_blob_patch : list[dict]
+            A JSON serializable object representing a valid JSON patch (RFC6902)
+            for access control fields that are stored in the access_blob.
 
         See Also
         --------
@@ -592,7 +627,19 @@ class BaseClient:
                 ).patch
             )
 
-        return metadata_patch, specs_patch
+        if not access_tags:
+            # empty list of access_tags should be a no-op
+            access_blob_patch = None
+        else:
+            ab_copy = deepcopy(self._item["attributes"]["access_blob"])
+            access_blob = {"tags": access_tags}
+            access_blob_patch = jsonpatch.JsonPatch.from_diff(
+                self._item["attributes"]["access_blob"],
+                apply_update_patch(ab_copy, access_blob),
+                dumps=orjson.dumps,
+            ).patch
+
+        return metadata_patch, specs_patch, access_blob_patch
 
     def _build_json_patch(self, origin, update_patch):
         """
@@ -618,7 +665,9 @@ class BaseClient:
         self,
         metadata_patch=None,
         specs_patch=None,
+        access_blob_patch=None,
         content_type=patch_mimetypes.JSON_PATCH,
+        drop_revision=False,
     ):
         """
         EXPERIMENTAL: Patch metadata using a JSON Patch (RFC6902).
@@ -632,6 +681,8 @@ class BaseClient:
         specs_patch : List[dict], optional
             JSON-serializable patch to be applied to metadata validation
             specifications list
+        access_blob_patch : List[dict], optional
+            JSON-serializable patch to be applied to the access_blob
         content_type : str
             Mimetype of the patches. Acceptable values are:
 
@@ -639,6 +690,9 @@ class BaseClient:
               (See https://datatracker.ietf.org/doc/html/rfc6902)
             * "application/merge-patch+json"
               (See https://datatracker.ietf.org/doc/html/rfc7386)
+        drop_revision : bool, optional
+            Replace current version without saving current version as a revision.
+            Use with caution.
 
         See Also
         --------
@@ -688,7 +742,11 @@ class BaseClient:
             "content-type": content_type,
             "metadata": metadata_patch,
             "specs": normalized_specs_patch,
+            "access_blob": access_blob_patch,
         }
+        params = {}
+        if drop_revision:
+            params["drop_revision"] = True
 
         for attempt in retry_context():
             with attempt:
@@ -696,6 +754,7 @@ class BaseClient:
                     self.context.http_client.patch(
                         self.item["links"]["self"],
                         content=safe_json_dump(data),
+                        params=params,
                     )
                 ).json()
 
@@ -716,7 +775,17 @@ class BaseClient:
             patched_specs = patcher(current_specs, normalized_specs_patch, content_type)
             self._item["attributes"]["specs"] = patched_specs
 
-    def replace_metadata(self, metadata=None, specs=None):
+        if access_blob_patch is not None:
+            if "access_blob" in content:
+                self._item["attributes"]["access_blob"] = content["access_blob"]
+            else:
+                self._item["attributes"]["access_blob"] = patcher(
+                    dict(self.access_blob), access_blob_patch, content_type
+                )
+
+    def replace_metadata(
+        self, metadata=None, specs=None, access_tags=None, drop_revision=False
+    ):
         """
         EXPERIMENTAL: Replace metadata entirely (see update_metadata).
 
@@ -730,6 +799,11 @@ class BaseClient:
         specs : List[str], optional
             List of names that are used to label that the data and/or metadata
             conform to some named standard specification.
+        access_tags: List[str], optional
+            Server-specific authZ tags in list form, used to confer access to the node.
+        drop_revision : bool, optional
+            Replace current version without saving current version as a revision.
+            Use with caution.
 
         See Also
         --------
@@ -739,24 +813,27 @@ class BaseClient:
 
         self._cached_len = None
 
-        if specs is None:
-            normalized_specs = None
+        if access_tags is None:
+            access_blob = None
         else:
-            normalized_specs = []
-            for spec in specs:
-                if isinstance(spec, str):
-                    spec = Spec(spec)
-                normalized_specs.append(asdict(spec))
+            access_blob = {"tags": access_tags}
+
         data = {
             "metadata": metadata,
-            "specs": normalized_specs,
+            "specs": normalize_specs(specs),
+            "access_blob": access_blob,
         }
+        params = {}
+        if drop_revision:
+            params["drop_revision"] = True
 
         for attempt in retry_context():
             with attempt:
                 content = handle_error(
                     self.context.http_client.put(
-                        self.item["links"]["self"], content=safe_json_dump(data)
+                        self.item["links"]["self"],
+                        content=safe_json_dump(data),
+                        params=params,
                     )
                 ).json()
 
@@ -766,12 +843,18 @@ class BaseClient:
                 # It is updated locally using the new version.
                 self._item["attributes"]["metadata"] = content["metadata"]
             else:
-                # Metadata was accepted as it si by the server.
-                # It is updated locally with the version submitted buy the client.
+                # Metadata was accepted as it is by the server.
+                # It is updated locally with the version submitted by the client.
                 self._item["attributes"]["metadata"] = metadata
 
         if specs is not None:
-            self._item["attributes"]["specs"] = normalized_specs
+            self._item["attributes"]["specs"] = normalize_specs(specs)
+
+        if access_blob is not None:
+            if "access_blob" in content:
+                self._item["attributes"]["access_blob"] = content["access_blob"]
+            else:
+                self._item["attributes"]["access_blob"] = access_blob
 
     @property
     def metadata_revisions(self):
@@ -781,8 +864,31 @@ class BaseClient:
 
         return self._metadata_revisions
 
-    def delete_tree(self):
-        endpoint = self.uri.replace("/metadata/", "/nodes/", 1)
+    def delete(self, recursive: bool = False, external_only: bool = True) -> None:
+        """Delete the node and its contents, if any.
+
+        Parameters
+        ----------
+        recursive : bool, optional
+            If True, descend into sub-nodes and delete their contents too.
+            Defaults to False.
+        external_only : bool, optional
+            If True, only delete externally-managed data. Defaults to True.
+        """
+
+        self._cached_len = None
+        for attempt in retry_context():
+            with attempt:
+                handle_error(
+                    self.context.http_client.delete(
+                        f"{self.uri}",
+                        params={"recursive": recursive, "external_only": external_only},
+                    )
+                )
+
+    def close_stream(self):
+        "Declare the end of a stream of writes to this node."
+        endpoint = self.uri.replace("/metadata/", "/stream/close/", 1)
         for attempt in retry_context():
             with attempt:
                 handle_error(self.context.http_client.delete(endpoint))

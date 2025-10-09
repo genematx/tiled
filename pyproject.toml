@@ -13,6 +13,7 @@ maintainers = [
   { name = "Brookhaven National Laboratory", email = "dallan@bnl.gov" },
 ]
 requires-python = ">=3.9"
+version = "0.1.5"
 
 # Dependencies common to both server and client; additional dependencies are
 # available depending on whether you are running client/server/both, and what
@@ -43,7 +44,7 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Physics",
 ]
 
-dynamic = ["version"]
+#dynamic = ["version"]
 
 [project.scripts]
 tiled = "tiled.commandline.main:main"
@@ -71,7 +72,7 @@ all = [
     "dask",
     "dask[array]",
     "dask[dataframe]",
-    "duckdb",
+    "duckdb <1.4.0",  # https://github.com/bluesky/tiled/issues/1144
     "entrypoints",
     "fastapi >=0.115.8",
     "h5netcdf",
@@ -81,19 +82,21 @@ all = [
     "jmespath",
     "lz4",
     "ndindex",
-    "numcodecs <0.16.0",
+    "numcodecs",
     "numpy",
+    "numba >=0.59.0",  # indirect, pinned to assist uv solve
     "openpyxl",
     "packaging",
     "pandas",
     "pillow",
     "prometheus_client",
-    "pyarrow",
+    "pyarrow >=14.0.1",  # includes fix to CVE 2023-47248
     "python-dateutil",
     "python-jose[cryptography]",
     "python-multipart",
+    "redis",
     "rich",
-    "sparse",
+    "sparse >=0.15.5",
     "sqlalchemy[asyncio] >=2",
     "stamina",
     "starlette >=0.38.0",
@@ -101,7 +104,7 @@ all = [
     "uvicorn[standard]",
     "watchfiles",
     "xarray",
-    "zarr <3",
+    "zarr",
     "zstandard",
 ]
 # These are needed by the client and server to transmit/receive arrays.
@@ -118,12 +121,14 @@ client = [
     "entrypoints",
     "lz4",
     "ndindex",
+    "numba >=0.59.0",  # indirect, pinned to assist uv solve
     "numpy",
     "pandas",
-    "pyarrow",
+    "pyarrow >=14.0.1",  # includes fix to CVE 2023-47248
     "rich",
-    "sparse",
+    "sparse >=0.15.5",
     "stamina",
+    "websockets",
     "watchfiles",
     "xarray",
     "zstandard",
@@ -139,22 +144,24 @@ compression = [
 dataframe = [
     "dask[dataframe]",
     "pandas",
-    "pyarrow",
+    "pyarrow >=14.0.1",  # includes fix to CVE 2023-47248
 ]
 # These are required for developing the package (running the tests, building
 # the documentation) but not necessarily required for _using_ it.
 dev = [
+    "aiohttp",
     "coverage",
     "flake8",
     "importlib_resources;python_version < \"3.9\"",
     "ipython",
     "ldap3",
+    "locust",
     "matplotlib",
     "mistune",
     "myst-parser",
     "numpydoc",
     "pre-commit",
-    "pytest <8",  # TMP pin while plugins catch up
+    "pytest",
     "pytest-asyncio",
     "pytest-mock",
     "pytest-rerunfailures",
@@ -179,6 +186,7 @@ minimal-client = [
     "rich",
     "stamina",
     "watchfiles",
+    "websockets",
 ]
 # These are the requirements needed for basic server functionality.
 minimal-server = [
@@ -193,16 +201,17 @@ minimal-server = [
     "fastapi >=0.115.8",
     "jinja2",
     "jmespath",
-    "numcodecs <0.16.0",
+    "numcodecs",
     "packaging",
     "prometheus_client",
     "python-dateutil",
     "python-jose[cryptography]",
     "python-multipart",
+    "redis",
     "sqlalchemy[asyncio] >=2",
     "starlette >=0.38.0",
     "uvicorn[standard]",
-    "zarr <3",
+    "zarr",
 ]
 # This is the "kichen sink" fully-featured server dependency set.
 server = [
@@ -222,7 +231,8 @@ server = [
     "dask",
     "dask[array]",
     "dask[dataframe]",
-    "duckdb",
+    "duckdb <1.4.0",  # https://github.com/bluesky/tiled/issues/1144
+    "entrypoints",
     "fastapi >=0.115.8",
     "h5netcdf",
     "h5py",
@@ -231,31 +241,36 @@ server = [
     "jmespath",
     "lz4",
     "ndindex",
-    "numcodecs <0.16.0",
+    "numba >=0.59.0",  # indirect, pinned to assist uv solve
+    "numcodecs",
     "numpy",
     "openpyxl",
     "packaging",
     "pandas",
     "pillow",
     "prometheus_client",
-    "pyarrow",
+    "pyarrow >=14.0.1",  # includes fix to CVE 2023-47248
     "python-dateutil",
     "python-jose[cryptography]",
     "python-multipart",
-    "sparse",
+    "sparse >=0.15.5",
+    "stamina",
+    "redis",
     "sqlalchemy[asyncio] >=2",
     "starlette >=0.38.0",
     "tifffile",
     "uvicorn[standard]",
+    "websockets",
     "xarray",
-    "zarr <3",
+    "zarr",
     "zstandard",
 ]
 # These are needed by the client and server to transmit/receive sparse arrays.
 sparse = [
     "ndindex",
-    "pyarrow",
-    "sparse",
+    "numba >=0.59.0",  # indirect, pinned to assist uv solve
+    "pyarrow >=14.0.1",  # includes fix to CVE 2023-47248
+    "sparse >=0.15.5",
 ]
 # These are needed by the client and server to transmit/receive xarrays.
 xarray = [
@@ -273,7 +288,9 @@ Documentation = "https://blueskyproject.io/tiled"
 [tool.hatch]
 version.source = "vcs"
 version.fallback-version = "0.0.0"
-build.hooks.vcs.version-file = "tiled/_version.py"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "tiled/_version.py"
 
 # Defining this (empty) section invokes hatch_build.py
 [tool.hatch.build.hooks.custom]
@@ -307,3 +324,12 @@ exclude = '''
   | web-frontend
 )
 '''
+
+[tool.coverage.run]
+data_file = "/tmp/tiled.coverage"
+
+[tool.coverage.report]
+exclude_lines = ["if __name__ == '__main__':"]
+
+[tool.coverage.paths]
+source = ["."]

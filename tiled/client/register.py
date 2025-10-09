@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import mimetypes
 import re
+from functools import partial
 from pathlib import Path
 
 import anyio
@@ -11,7 +12,7 @@ import watchfiles
 
 from ..mimetypes import (
     DEFAULT_MIMETYPES_BY_FILE_EXT,
-    DEFAULT_REGISTERATION_ADAPTERS_BY_MIMETYPE,
+    DEFAULT_REGISTRATION_ADAPTERS_BY_MIMETYPE,
 )
 from ..structures.core import StructureFamily
 from ..structures.data_source import Asset, DataSource, Management
@@ -103,14 +104,14 @@ class Settings:
         key_from_filename=None,
         filter=None,
     ):
-        # If parameters come from a configuration file, they are given
+        # If parameters come from a configuration file, they
         # are given as importable strings, like "package.module:Reader".
         adapters_by_mimetype = adapters_by_mimetype or {}
         for key, value in list((adapters_by_mimetype).items()):
             if isinstance(value, str):
                 adapters_by_mimetype[key] = import_object(value)
         merged_adapters_by_mimetype = collections.ChainMap(
-            adapters_by_mimetype, DEFAULT_REGISTERATION_ADAPTERS_BY_MIMETYPE
+            adapters_by_mimetype, DEFAULT_REGISTRATION_ADAPTERS_BY_MIMETYPE
         )
         if isinstance(key_from_filename, str):
             key_from_filename = import_object(key_from_filename)
@@ -171,6 +172,7 @@ async def register(
                 metadata={},
                 specs=[],
                 key=key,
+                access_tags=[],
             )
             # TODO When we have a tiled AsyncClient, use that.
             child_node = await anyio.to_thread.run_sync(node.get, segment)
@@ -180,7 +182,7 @@ async def register(
         if overwrite:
             logger.info(f"  Overwriting '/{'/'.join(prefix_parts)}'")
             # TODO When we have a tiled AsyncClient, use that.
-            await anyio.to_thread.run_sync(node.delete_tree)
+            await anyio.to_thread.run_sync(partial(node.delete, recursive=True))
         await _walk(
             node,
             Path(path),
@@ -230,6 +232,7 @@ async def _walk(
             data_sources=[],
             metadata={},
             specs=[],
+            access_tags=[],
         )
         # TODO When we have a tiled AsyncClient, use that.
         child_node = await anyio.to_thread.run_sync(node.get, key)
@@ -347,14 +350,16 @@ IMG_SEQUENCE_STEM_PATTERNS = {
     ".tiff": re.compile(r"^(.*?)(\d+)\.(?:tif|tiff)$"),
     ".jpg": re.compile(r"^(.*?)(\d+)\.(?:jpg|jpeg)$"),
     ".jpeg": re.compile(r"^(.*?)(\d+)\.(?:jpg|jpeg)$"),
+    ".npy": re.compile(r"^(.*?)(\d+)\.npy$"),
 }
 IMG_SEQUENCE_EMPTY_NAME_ROOT = "_unnamed"
 
 IMG_SEQUENCE_MIMETYPES = {
     ".tif": "multipart/related;type=image/tiff",
     ".tiff": "multipart/related;type=image/tiff",
-    ".jpg": "multipart/related;type=image/jpeg",
+    ".jpg": "multipart/related;type=image/npy",
     ".jpeg": "multipart/related;type=image/jpeg",
+    ".npy": "multipart/related;type=application/x-npy",
 }
 
 
@@ -620,7 +625,7 @@ async def create_node_or_drop_collision(
         if err.response.status_code == httpx.codes.CONFLICT:
             # To avoid ambiguity include _neither_ the original nor the new one.
             offender = await anyio.to_thread.run_sync(node.get, key)
-            await anyio.to_thread.run_sync(offender.delete_tree)
+            await anyio.to_thread.run_sync(partial(offender.delete, recursive=True))
             logger.warning(
                 "   COLLISION: Multiple files would result in node at '%s'. Skipping all.",
                 err.args[0],

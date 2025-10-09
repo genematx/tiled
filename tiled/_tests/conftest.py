@@ -65,6 +65,21 @@ def buffer():
         yield buffer
 
 
+@pytest.fixture(scope="function")
+def buffer_factory():
+    buffers = []
+
+    def _buffer():
+        buf = io.BytesIO()
+        buffers.append(buf)
+        return buf
+
+    yield _buffer
+
+    for buf in buffers:
+        buf.close()
+
+
 @pytest.fixture
 def tmp_profiles_dir():
     """
@@ -125,20 +140,30 @@ TILED_TEST_POSTGRESQL_URI = os.getenv("TILED_TEST_POSTGRESQL_URI")
 
 
 @pytest_asyncio.fixture
-async def sqlite_database_uri(tmpdir):
-    yield f"sqlite:///{tmpdir}/tiled.sqlite"
+async def sqlite_uri(tmp_path: Path):
+    yield f"sqlite:///{tmp_path}/tiled.sqlite"
+
+
+@pytest_asyncio.fixture(scope="function")
+async def duckdb_uri(tmp_path: Path):
+    yield f"duckdb:///{tmp_path}/tiled.duckdb"
 
 
 @pytest_asyncio.fixture
-async def postgresql_database_uri():
+async def postgres_uri():
     if not TILED_TEST_POSTGRESQL_URI:
         raise pytest.skip("No TILED_TEST_POSTGRESQL_URI configured")
     async with temp_postgres(TILED_TEST_POSTGRESQL_URI) as uri_with_database:
         yield uri_with_database
 
 
-@pytest.fixture(params=["sqlite_database_uri", "postgresql_database_uri"])
-def sqlite_or_postgresql_database_uri(request):
+@pytest.fixture(params=["sqlite_uri", "postgres_uri"])
+def sqlite_or_postgres_uri(request):
+    yield request.getfixturevalue(request.param)
+
+
+@pytest.fixture(params=["sqlite_uri", "duckdb_uri", "postgres_uri"])
+def sql_storage_uri(request):
     yield request.getfixturevalue(request.param)
 
 
@@ -268,3 +293,17 @@ def url_limit(request: pytest.FixtureRequest):
     yield
     # Then restore the original value.
     BaseClient.URL_CHARACTER_LIMIT = PREVIOUS_LIMIT
+
+
+@pytest.fixture
+def redis_uri():
+    if uri := os.getenv("TILED_TEST_REDIS"):
+        import redis
+
+        client = redis.from_url(uri, socket_timeout=10, socket_connect_timeout=30)
+        # Delete all keys from the current database before and after test.
+        client.flushdb()
+        yield uri
+        client.flushdb()
+    else:
+        raise pytest.skip("No TILED_TEST_REDIS configured")

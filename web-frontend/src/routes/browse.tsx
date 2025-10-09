@@ -4,8 +4,8 @@ import { Suspense, lazy } from "react";
 import { useContext, useEffect, useState } from "react";
 
 import Box from "@mui/material/Box";
-import ErrorBoundary from "../components/error-boundary";
-import NodeBreadcrumbs from "../components/node-breadcrumbs";
+import ErrorBoundary from "../components/error-boundary/error-boundary";
+import NodeBreadcrumbs from "../components/node-breadcrumbs/node-breadcrumbs";
 import Paper from "@mui/material/Paper";
 import PropTypes from "prop-types";
 import Skeleton from "@mui/material/Skeleton";
@@ -17,18 +17,28 @@ import { metadata } from "../client";
 import { SettingsContext } from "../context/settings";
 import { useParams } from "react-router-dom";
 
-const ArrayOverview = lazy(() => import("../components/overview-array"));
+const ArrayOverview = lazy(
+  () => import("../components/overview-array/overview-array"),
+);
 const TableOverview = lazy(
-  () => import("../components/overview-table")
+  () => import("../components/overview-table/overview-table"),
 );
-const DownloadArray = lazy(() => import("../components/download-array"));
+const DownloadArray = lazy(
+  () => import("../components/download-array/download-array"),
+);
 const DownloadTable = lazy(
-  () => import("../components/download-table")
+  () => import("../components/download-table/download-table"),
 );
-const DownloadNode = lazy(() => import("../components/download-node"));
-const JSONViewer = lazy(() => import("../components/json-viewer"));
-const MetadataView = lazy(() => import("../components/metadata-view"));
-const NodeOverview = lazy(() => import("../components/overview-generic-node"));
+const DownloadNode = lazy(
+  () => import("../components/download-node/download-node"),
+);
+const JSONViewer = lazy(() => import("../components/json-viewer/json-viewer"));
+const MetadataView = lazy(
+  () => import("../components/metadata-view/metadata-view"),
+);
+const NodeOverview = lazy(
+  () => import("../components/overview-generic-node/overview-generic-node"),
+);
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -76,7 +86,9 @@ interface DispatchProps {
     | undefined;
 }
 
-const DownloadDispatch: React.FunctionComponent<DispatchProps> = (props) => {
+export const DownloadDispatch: React.FunctionComponent<DispatchProps> = (
+  props,
+) => {
   // Dispatch to a specific overview component based on the structure family.
   // In the future we will extend this to consider 'specs' as well.
   if (props.item !== undefined) {
@@ -120,7 +132,9 @@ const DownloadDispatch: React.FunctionComponent<DispatchProps> = (props) => {
   return <Skeleton variant="rectangular" />;
 };
 
-const OverviewDispatch: React.FunctionComponent<DispatchProps> = (props) => {
+export const OverviewDispatch: React.FunctionComponent<DispatchProps> = (
+  props,
+) => {
   // Dispatch to a specific overview component based on the structure family.
   // In the future we will extend this to consider 'specs' as well.
   if (props.item !== undefined) {
@@ -138,9 +152,7 @@ const OverviewDispatch: React.FunctionComponent<DispatchProps> = (props) => {
           />
         );
       case "table":
-        return (
-          <TableOverview segments={props.segments} item={props.item} />
-        );
+        return <TableOverview segments={props.segments} item={props.item} />;
       default:
         return <div>Unknown structure family "{structureFamily}"</div>;
     }
@@ -168,8 +180,8 @@ function Browse() {
   }
 }
 
-const NodeTabs: React.FunctionComponent<IProps> = (props) => {
-  const settings = useContext(SettingsContext)
+export const NodeTabs: React.FunctionComponent<IProps> = (props) => {
+  const settings = useContext(SettingsContext);
   const [tabValue, setTabValue] = useState(0);
   const handleTabChange = (event: React.ChangeEvent<any>, newValue: number) => {
     setTabValue(newValue);
@@ -186,11 +198,12 @@ const NodeTabs: React.FunctionComponent<IProps> = (props) => {
     const controller = new AbortController();
     async function loadData() {
       // Request all the attributes.
-      var result = await metadata(settings.api_url, props.segments, controller.signal, [
-        "structure_family",
-        "structure",
-        "specs",
-      ]);
+      const result = await metadata(
+        settings.api_url,
+        props.segments,
+        controller.signal,
+        ["structure_family", "structure", "specs"],
+      );
       if (result !== undefined) {
         setItem(result);
       }
@@ -208,14 +221,19 @@ const NodeTabs: React.FunctionComponent<IProps> = (props) => {
     const controller = new AbortController();
     async function loadData() {
       // Request all the attributes.
-      var result = await metadata(settings.api_url, props.segments, controller.signal, [
-        "structure_family",
-        "structure",
-        "specs",
-        "metadata",
-        "sorting",
-        "count",
-      ]);
+      const result = await metadata(
+        settings.api_url,
+        props.segments,
+        controller.signal,
+        [
+          "structure_family",
+          "structure",
+          "specs",
+          "metadata",
+          "sorting",
+          "count",
+        ],
+      );
       if (result !== undefined) {
         setFullItem(result);
       }

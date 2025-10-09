@@ -4,8 +4,9 @@ import pyarrow as pa
 import pytest
 
 from tiled.adapters.arrow import ArrowAdapter
+from tiled.storage import FileStorage
 from tiled.structures.core import StructureFamily
-from tiled.structures.data_source import DataSource, Management, Storage
+from tiled.structures.data_source import DataSource, Management
 from tiled.structures.table import TableStructure
 
 names = ["f0", "f1", "f2"]
@@ -38,7 +39,7 @@ def data_source_from_init_storage() -> DataSource[TableStructure]:
         structure=structure,
         assets=[],
     )
-    storage = Storage(filesystem=data_uri, sql=None)
+    storage = FileStorage(data_uri)
     return ArrowAdapter.init_storage(
         data_source=data_source, storage=storage, path_parts=[]
     )
@@ -60,25 +61,25 @@ def test_attributes(adapter: ArrowAdapter) -> None:
 
 def test_write_read(adapter: ArrowAdapter) -> None:
     # test writing to a partition and reading it
-    adapter.write_partition(batch0, 0)
+    adapter.write_partition(0, batch0)
     assert pa.Table.from_arrays(data0, names) == pa.Table.from_pandas(
         adapter.read_partition(0)
     )
 
-    adapter.write_partition([batch0, batch1], 1)
+    adapter.write_partition(1, [batch0, batch1])
     assert pa.Table.from_batches([batch0, batch1]) == pa.Table.from_pandas(
         adapter.read_partition(1)
     )
 
-    adapter.write_partition([batch0, batch1, batch2], 2)
+    adapter.write_partition(2, [batch0, batch1, batch2])
     assert pa.Table.from_batches([batch0, batch1, batch2]) == pa.Table.from_pandas(
         adapter.read_partition(2)
     )
 
     # test write to all partitions and read all
-    adapter.write_partition([batch0, batch1, batch2], 0)
-    adapter.write_partition([batch2, batch0, batch1], 1)
-    adapter.write_partition([batch1, batch2, batch0], 2)
+    adapter.write_partition(0, [batch0, batch1, batch2])
+    adapter.write_partition(1, [batch2, batch0, batch1])
+    adapter.write_partition(2, [batch1, batch2, batch0])
 
     assert pa.Table.from_pandas(adapter.read()) == pa.Table.from_batches(
         [batch0, batch1, batch2, batch2, batch0, batch1, batch1, batch2, batch0]

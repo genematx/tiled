@@ -2,7 +2,6 @@ import base64
 import builtins
 import collections.abc
 import contextlib
-import enum
 import functools
 import importlib
 import importlib.util
@@ -16,10 +15,11 @@ import threading
 import warnings
 from collections import namedtuple
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Generic, Iterator, Optional, Tuple, TypeVar, Union
 from urllib.parse import urlparse, urlunparse
 
 import anyio
+import yaml
 
 # helper for avoiding re-typing patch mimetypes
 # namedtuple for the lack of StrEnum in py<3.11
@@ -32,13 +32,18 @@ patch_mimetypes = namedtuple(
 )
 
 
-class ListView(collections.abc.Sequence):
+T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+class ListView(collections.abc.Sequence[V], Generic[V]):
     "An immutable view of a list."
 
-    def __init__(self, seq):
+    def __init__(self, seq: collections.abc.Sequence[V]):
         self._internal_list = list(seq)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{type(self).__name__}({self._internal_list!r})"
 
     def _repr_pretty_(self, p, cycle):
@@ -56,35 +61,35 @@ class ListView(collections.abc.Sequence):
             list_ = list(self._internal_list)
         p.text(pformat(list_))
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> V:
         return self._internal_list[index]
 
-    def __iter__(self):
+    def __iter__(self) -> collections.abc.Iterator[V]:
         yield from self._internal_list
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._internal_list)
 
-    def __setitem__(self, index, value):
+    def __setitem__(self, index: int, value: V):
         raise TypeError("Setting values is not allowed.")
 
-    def __delitem__(self, index):
+    def __delitem__(self, index: int):
         raise TypeError("Deleting values is not allowed.")
 
-    def __add__(self, other):
+    def __add__(self, other: collections.abc.Sequence[K]) -> "ListView[V | K]":
         return type(self)(self._internal_list + other)
 
-    def __eq__(self, other):
+    def __eq__(self, other: Any) -> bool:
         return self._internal_list == other
 
 
-class DictView(collections.abc.Mapping):
+class DictView(collections.abc.Mapping[K, V], Generic[K, V]):
     "An immutable view of a dict."
 
-    def __init__(self, d):
+    def __init__(self, d: collections.abc.Mapping[K, V]):
         self._internal_dict = d
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{type(self).__name__}({self._internal_dict!r})"
 
     def _repr_pretty_(self, p, cycle):
@@ -102,22 +107,22 @@ class DictView(collections.abc.Mapping):
             d = dict(self._internal_dict)
         p.text(pformat(d))
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: K) -> V:
         return self._internal_dict[key]
 
-    def __iter__(self):
+    def __iter__(self) -> collections.abc.Iterator[K]:
         yield from self._internal_dict
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._internal_dict)
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: K, value: V):
         raise TypeError("Setting items is not allowed.")
 
-    def __delitem__(self, key):
+    def __delitem__(self, key: K):
         raise TypeError("Deleting items is not allowed.")
 
-    def __eq__(self, other):
+    def __eq__(self, other: Any) -> bool:
         return self._internal_dict == other
 
 
@@ -128,18 +133,18 @@ class DictView(collections.abc.Mapping):
 _OneShotCachedMapWrapper = collections.namedtuple("_OneShotCachedMapWrapper", ("func",))
 
 
-class OneShotCachedMap(collections.abc.Mapping):
+class OneShotCachedMap(collections.abc.Mapping[K, V], Generic[K, V]):
     __slots__ = ("__mapping", "__lock")
 
-    def __init__(self, *args, **kwargs):
-        dictionary = dict(*args, **kwargs)
+    def __init__(self, *args, **kwargs: Callable[[], V]):
+        dictionary: dict[K, Union[Callable[[], V], V]] = dict(*args, **kwargs)
         wrap = _OneShotCachedMapWrapper
         # TODO should be recursive lock?
         self.__lock = threading.Lock()
         # TODO type validation?
         self.__mapping = {k: wrap(v) for k, v in dictionary.items()}
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: K) -> V:
         # TODO per-key locking?
         with self.__lock:
             v = self.__mapping[key]
@@ -148,7 +153,7 @@ class OneShotCachedMap(collections.abc.Mapping):
                 v = self.__mapping[key] = v.func()
         return v
 
-    def set(self, key, value_factory):
+    def set(self, key: K, value_factory: Callable[[], V]):
         """
         Set key to a callable the returns value.
         """
@@ -158,38 +163,40 @@ class OneShotCachedMap(collections.abc.Mapping):
             )
         self.__mapping[key] = _OneShotCachedMapWrapper(value_factory)
 
-    def discard(self, key):
+    def discard(self, key: K):
         """
         Discard a key if it is present. This is idempotent.
         """
         self.__mapping.pop(key, None)
         self.evict(key)
 
-    def remove(self, key):
+    def remove(self, key: K):
         """
         Remove a key. Raises KeyError if key not present.
         """
         del self.__mapping[key]
         self.evict(key)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.__mapping)
 
-    def __iter__(self):
+    def __iter__(self) -> collections.abc.Iterator[K]:
         return iter(self.__mapping)
 
-    def __contains__(self, k):
+    def __contains__(self, k: K) -> bool:
         # make sure checking 'in' does not trigger evaluation
         return k in self.__mapping
 
-    def __getstate__(self):
+    def __getstate__(self) -> collections.abc.Mapping[K, Union[Callable[[], V], V]]:
         return self.__mapping
 
-    def __setstate__(self, mapping):
+    def __setstate__(
+        self, mapping: collections.abc.Mapping[K, Union[Callable[[], V], V]]
+    ):
         self.__mapping = mapping
         self.__lock = threading.Lock()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         d = {}
         for k, v in self.__mapping.items():
             if isinstance(v, _OneShotCachedMapWrapper):
@@ -202,7 +209,7 @@ class OneShotCachedMap(collections.abc.Mapping):
         )
 
 
-class CachingMap(collections.abc.Mapping):
+class CachingMap(collections.abc.Mapping[K, V], Generic[K, V]):
     """
     Mapping that computes values on read and caches them in a configured cache.
 
@@ -216,11 +223,13 @@ class CachingMap(collections.abc.Mapping):
 
     __slots__ = ("__mapping", "__cache")
 
-    def __init__(self, mapping, cache):
+    def __init__(
+        self, mapping: collections.abc.Mapping[K, Callable[[], V]], cache: dict[K, V]
+    ):
         self.__mapping = mapping
         self.__cache = cache
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: K) -> V:
         try:
             return self.__cache[key]
         except KeyError:
@@ -228,7 +237,7 @@ class CachingMap(collections.abc.Mapping):
             self.__cache[key] = value
             return value
 
-    def set(self, key, value_factory):
+    def set(self, key: K, value_factory: Callable[[], V]):
         """
         Set key to a callable the returns value.
         """
@@ -240,21 +249,21 @@ class CachingMap(collections.abc.Mapping):
         # This may be replacing (updating) an existing key. Clear any cached value.
         self.evict(key)
 
-    def discard(self, key):
+    def discard(self, key: K):
         """
         Discard a key if it is present. This is idempotent.
         """
         self.__mapping.pop(key, None)
         self.evict(key)
 
-    def remove(self, key):
+    def remove(self, key: K):
         """
         Remove a key. Raises KeyError if key not present.
         """
         del self.__mapping[key]
         self.evict(key)
 
-    def evict(self, key):
+    def evict(self, key: K):
         """
         Evict a key from the internal cache. This is idempotent.
 
@@ -263,25 +272,29 @@ class CachingMap(collections.abc.Mapping):
         """
         self.__cache.pop(key, None)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.__mapping)
 
-    def __iter__(self):
+    def __iter__(self) -> collections.abc.Iterator[K]:
         return iter(self.__mapping)
 
-    def __contains__(self, key):
+    def __contains__(self, key: K) -> bool:
         # Ensure checking 'in' does not trigger evaluation.
         return key in self.__mapping
 
-    def __getstate__(self):
+    def __getstate__(
+        self,
+    ) -> Tuple[collections.abc.Mapping[K, Callable[[], V]], dict[K, V]]:
         return self.__mapping, self.__cache
 
-    def __setstate__(self, state):
+    def __setstate__(
+        self, state: Tuple[collections.abc.Mapping[K, Callable[[], V]], dict[K, V]]
+    ):
         mapping, cache = state
         self.__mapping = mapping
         self.__cache = cache
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         if self.__cache is None:
             d = {k: "<lazy>" for k in self.__mapping}
         else:
@@ -297,11 +310,6 @@ class CachingMap(collections.abc.Mapping):
             f"<{type(self).__name__}"
             "({" + ", ".join(f"{k!r}: {v!s}" for k, v in d.items()) + "})>"
         )
-
-
-class SpecialUsers(str, enum.Enum):
-    public = "public"
-    admin = "admin"
 
 
 def _line(nodes, last):
@@ -342,7 +350,7 @@ def gen_tree(tree, nodes=None, last=None):
     "A generator of lines for the tree utility"
 
     # Normally, traversing a Tree will cause the structure clients to be
-    # instanitated which in turn triggers import of the associated libraries like
+    # instantiated which in turn triggers import of the associated libraries like
     # numpy, pandas, and xarray. We want to avoid paying for that, especially
     # when this function is used in a CLI where import overhead can accumulate to
     # about 2 seconds, the bulk of the time. Therefore, we do something a bit
@@ -378,7 +386,7 @@ def tree(tree, max_lines=20):
     ----------
     tree : Tree
     max_lines: int or None, optional
-        By default, output is trucated at 20 lines. ``None`` means "Do not
+        By default, output is truncated at 20 lines. ``None`` means "Do not
         truncate."
 
     Examples
@@ -426,6 +434,7 @@ class Sentinel:
 
 UNCHANGED = Sentinel("UNCHANGED")
 UNSET = Sentinel("UNSET")
+SingleUserPrincipal = Sentinel("SingleUserPrincipal")
 
 
 def import_object(colon_separated_string, accept_live_object=True):
@@ -451,8 +460,20 @@ def import_object(colon_separated_string, accept_live_object=True):
     for attr in obj_path.split("."):
         if not attr.isidentifier():
             raise ValueError(MESSAGE)
-    module = importlib.import_module(import_path)
-    return operator.attrgetter(obj_path)(module)
+    try:
+        module = importlib.import_module(import_path)
+    except ModuleNotFoundError:
+        raise ValueError(
+            f"Could not parse {colon_separated_string!r}: "
+            f"No module {import_path!r} could be found"
+        )
+    try:
+        return operator.attrgetter(obj_path)(module)
+    except AttributeError:
+        raise ValueError(
+            f"Could not parse {colon_separated_string!r}: "
+            f"No object {obj_path!r} found in module {module!r}"
+        )
 
 
 def modules_available(*module_names):
@@ -465,7 +486,7 @@ def modules_available(*module_names):
     return False
 
 
-def parse(file):
+def parse(file: Path) -> dict[Any, Any]:
     """
     Given a config file, parse it.
 
@@ -473,11 +494,12 @@ def parse(file):
     """
     import yaml
 
-    content = yaml.safe_load(file.read())
-    return expand_environment_variables(content)
+    with open(file) as src:
+        content = yaml.safe_load(src.read())
+        return expand_environment_variables(content)
 
 
-def expand_environment_variables(config):
+def expand_environment_variables(config: T) -> T:
     """Expand environment variables in a nested config dictionary
 
     VENDORED FROM dask.config.
@@ -500,7 +522,8 @@ def expand_environment_variables(config):
     {'x': [1, 2, 'my-username']}
     """
     if isinstance(config, collections.abc.Mapping):
-        return {k: expand_environment_variables(v) for k, v in config.items()}
+        # ignore type checks as type might change but it's still a mapping
+        return {k: expand_environment_variables(v) for k, v in config.items()}  # type: ignore
     elif isinstance(config, str):
         return os.path.expandvars(config)
     elif isinstance(config, (list, tuple, builtins.set)):
@@ -510,7 +533,7 @@ def expand_environment_variables(config):
 
 
 @contextlib.contextmanager
-def prepend_to_sys_path(*paths):
+def prepend_to_sys_path(*paths: Union[str, Path]) -> Iterator[None]:
     "Temporarily prepend items to sys.path."
 
     for item in reversed(paths):
@@ -574,11 +597,13 @@ class UnsupportedQueryType(TypeError):
 
 class Conflicts(Exception):
     "Prompts the server to send 409 Conflicts with message"
+
     pass
 
 
 class BrokenLink(Exception):
     "Prompts the server to send 410 Gone with message"
+
     pass
 
 
@@ -594,7 +619,7 @@ def get_share_tiled_path():
     """
     Walk up until we find share/tiled.
 
-    Because it is outside the pacakge, its location relative to us is up to the
+    Because it is outside the package, its location relative to us is up to the
     package manager. Rather than assuming that it is a specific number of
     directory levels above us, we walk upward until we find it. A file with
     long unique name helps us confirm that we have found the right directory.
@@ -763,6 +788,31 @@ def ensure_uri(uri_or_path) -> str:
     return str(uri_str)
 
 
+def sanitize_uri(uri: str) -> tuple[str, Optional[str], Optional[str]]:
+    "Remove the username and password from uri if they are present."
+    parsed_uri = urlparse(uri)
+    netloc = parsed_uri.netloc
+    if "@" in netloc:
+        auth, netloc = netloc.split("@")
+        # Remove username and password from the netloc.
+        if ":" in auth:
+            username, password = auth.split(":", 1)
+        else:
+            username, password = auth, None
+        # Create clean components with the updated netloc
+        clean_components = (
+            parsed_uri.scheme,
+            netloc,
+            parsed_uri.path,
+            parsed_uri.params,
+            parsed_uri.query,
+            parsed_uri.fragment,
+        )
+        return urlunparse(clean_components), username, password
+
+    return uri, None, None
+
+
 SCHEME_TO_SCHEME_PLUS_DRIVER = {
     "postgresql": "postgresql+asyncpg",
     "sqlite": "sqlite+aiosqlite",
@@ -774,7 +824,7 @@ def ensure_specified_sql_driver(uri: str) -> str:
     Given a URI without a driver in the scheme, add Tiled's preferred driver.
 
     If a driver is already specified, the specified one will be used; it
-    will NOT be overriden by this function.
+    will NOT be overridden by this function.
 
     'postgresql://...' -> 'postgresql+asynpg://...'
     'sqlite://...' -> 'sqlite+aiosqlite://...'
@@ -824,3 +874,32 @@ class catch_warning_msg(warnings.catch_warnings):
         super().__enter__()
         self.apply_filter()
         return self
+
+
+def parse_mimetype(mimetype: str) -> tuple[str, dict]:
+    """
+    Parse 'text/csv;header=absent' -> ('text/csv', {'header': 'absent'})
+    """
+    base, *param_tokens = mimetype.split(";")
+    params = {}
+    for item in param_tokens:
+        try:
+            key, value = item.strip().split("=", 2)
+        except Exception:
+            raise ValueError(
+                f"Could not parse {item} as 'key=value' mimetype parameter"
+            )
+        params[key] = value
+    return base, params
+
+
+class InterningLoader(yaml.loader.BaseLoader):
+    pass
+
+
+def interning_constructor(loader, node):
+    value = loader.construct_scalar(node)
+    return sys.intern(value)
+
+
+InterningLoader.add_constructor("tag:yaml.org,2002:str", interning_constructor)

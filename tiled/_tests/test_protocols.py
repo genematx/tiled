@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import dask.dataframe
 import numpy
@@ -9,7 +9,8 @@ import sparse
 from numpy.typing import NDArray
 from pytest_mock import MockFixture
 
-from ..access_policies import ALL_ACCESS
+from ..access_control.access_policies import ALL_ACCESS
+from ..access_control.scopes import ALL_SCOPES
 from ..adapters.awkward_directory_container import DirectoryContainer
 from ..adapters.protocols import (
     AccessPolicy,
@@ -20,8 +21,8 @@ from ..adapters.protocols import (
     TableAdapter,
 )
 from ..ndslice import NDSlice
-from ..scopes import ALL_SCOPES
 from ..server.schemas import Principal, PrincipalType
+from ..storage import Storage
 from ..structures.array import ArrayStructure, BuiltinDtype
 from ..structures.awkward import AwkwardStructure
 from ..structures.core import Spec, StructureFamily
@@ -32,6 +33,7 @@ from ..type_aliases import JSON, Filters, Scopes
 
 class CustomArrayAdapter:
     structure_family: Literal[StructureFamily.array] = StructureFamily.array
+    supported_storage: Set[type[Storage]] = set()
 
     def __init__(
         self,
@@ -103,6 +105,7 @@ def test_arrayadapter_protocol(mocker: MockFixture) -> None:
 
 class CustomAwkwardAdapter:
     structure_family: Literal[StructureFamily.awkward] = StructureFamily.awkward
+    supported_storage: Set[type[Storage]] = set()
 
     def __init__(
         self,
@@ -179,6 +182,7 @@ def test_awkwardadapter_protocol(mocker: MockFixture) -> None:
 
 class CustomSparseAdapter:
     structure_family: Literal[StructureFamily.sparse] = StructureFamily.sparse
+    supported_storage: Set[type[Storage]] = set()
 
     def __init__(
         self,
@@ -244,9 +248,13 @@ def test_sparseadapter_protocol(mocker: MockFixture) -> None:
     mock_call4 = mocker.patch.object(CustomSparseAdapter, "specs")
     mock_call5 = mocker.patch.object(CustomSparseAdapter, "metadata")
 
-    structure = COOStructure(shape=(2 * 5,), chunks=((5, 5),))
-
     array = numpy.random.rand(2, 512, 512)
+
+    structure = COOStructure(
+        shape=(2 * 5,),
+        chunks=((5, 5),),
+        data_type=BuiltinDtype.from_numpy_dtype(array.dtype),
+    )
     blocks: Dict[Tuple[int, ...], Tuple[NDArray[Any], Any]] = {(1,): (array, (1,))}
     metadata: JSON = {"foo": "bar"}
     anyslice = NDSlice(1, 1, 1)
@@ -265,6 +273,7 @@ def test_sparseadapter_protocol(mocker: MockFixture) -> None:
 
 class CustomTableAdapter:
     structure_family: Literal[StructureFamily.table] = StructureFamily.table
+    supported_storage: Set[type[Storage]] = set()
 
     def __init__(
         self,
@@ -371,7 +380,11 @@ class CustomAccessPolicy(AccessPolicy):
         return None
 
     async def allowed_scopes(
-        self, node: BaseAdapter, principal: Principal, path_parts: List[Any]
+        self,
+        node: BaseAdapter,
+        principal: Principal,
+        authn_access_tags: Optional[Set[str]],
+        authn_scopes: Scopes,
     ) -> Scopes:
         allowed = self.scopes
         somemetadata = node.metadata()  # noqa: 841
@@ -381,8 +394,9 @@ class CustomAccessPolicy(AccessPolicy):
         self,
         node: BaseAdapter,
         principal: Principal,
+        authn_access_tags: Optional[Set[str]],
+        authn_scopes: Scopes,
         scopes: Scopes,
-        path_parts: List[Any],
     ) -> Filters:
         queries: Filters = []
         somespecs = node.specs()  # noqa: 841
@@ -393,11 +407,12 @@ async def accesspolicy_protocol_functions(
     policy: AccessPolicy,
     node: BaseAdapter,
     principal: Principal,
+    authn_access_tags: Optional[Set[str]],
+    authn_scopes: Scopes,
     scopes: Scopes,
-    path_parts: List[Any],
 ) -> None:
-    await policy.allowed_scopes(node, principal, path_parts)
-    await policy.filters(node, principal, scopes, path_parts)
+    await policy.allowed_scopes(node, principal, authn_access_tags, authn_scopes)
+    await policy.filters(node, principal, authn_access_tags, authn_scopes, scopes)
 
 
 @pytest.mark.asyncio  # type: ignore
@@ -414,13 +429,19 @@ async def test_accesspolicy_protocol(mocker: MockFixture) -> None:
     principal = Principal(
         uuid="12345678124123412345678123456781", type=PrincipalType.user
     )
+    authn_access_tags = {"qux", "quux"}
+    authn_scopes = {"abc", "baz"}
     scopes = {"abc"}
-    path_parts = ["wx", "yz"]
 
     anyawkwardadapter = CustomAwkwardAdapter(container, structure, metadata=metadata)
 
     await accesspolicy_protocol_functions(
-        anyaccesspolicy, anyawkwardadapter, principal, scopes, path_parts
+        anyaccesspolicy,
+        anyawkwardadapter,
+        principal,
+        authn_access_tags,
+        authn_scopes,
+        scopes,
     )
     mock_call.assert_called_once()
     mock_call2.assert_called_once()

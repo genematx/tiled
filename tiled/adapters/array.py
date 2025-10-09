@@ -1,4 +1,5 @@
-from typing import Any, List, Optional, Tuple
+import contextlib
+from typing import Any, List, Optional, Set, Tuple
 
 import dask.array
 import numpy
@@ -6,6 +7,7 @@ import pandas
 from numpy.typing import NDArray
 
 from ..ndslice import NDSlice
+from ..storage import Storage
 from ..structures.array import ArrayStructure
 from ..structures.core import Spec, StructureFamily
 from ..type_aliases import JSON
@@ -27,6 +29,7 @@ class ArrayAdapter:
     """
 
     structure_family = StructureFamily.array
+    supported_storage: Set[type[Storage]] = set()
 
     def __init__(
         self,
@@ -80,6 +83,17 @@ class ArrayAdapter:
         if not hasattr(array, "__array__"):
             array = numpy.asanyarray(array)
 
+        # Convert array of arrays to ND array to expose the underlying dtype
+        is_array_of_arrays = (
+            array.dtype == "object"
+            and array.shape[0]
+            and isinstance(array[0], numpy.ndarray)
+        )
+        if is_array_of_arrays:
+            with contextlib.suppress(ValueError):
+                # only uniform arrays (with same dimensions) are stackable
+                array = numpy.vstack(array)
+
         # Convert (experimental) pandas.StringDtype to numpy's unicode string dtype
         is_likely_string_dtype = isinstance(array.dtype, pandas.StringDtype) or (
             array.dtype == "object" and array.dtype.fields is None
@@ -98,12 +112,6 @@ class ArrayAdapter:
         )
 
     def __repr__(self) -> str:
-        """
-
-        Returns
-        -------
-
-        """
         return f"{type(self).__name__}({self._array!r})"
 
     @property

@@ -3,7 +3,17 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import pydantic.generics
 from pydantic import ConfigDict, Field, StringConstraints
@@ -12,7 +22,7 @@ from typing_extensions import Annotated, TypedDict
 
 from ..structures.array import ArrayStructure
 from ..structures.awkward import AwkwardStructure
-from ..structures.core import STRUCTURE_TYPES, StructureFamily
+from ..structures.core import STRUCTURE_TYPES, Spec, StructureFamily
 from ..structures.data_source import Management
 from ..structures.sparse import SparseStructure
 from ..structures.table import TableStructure
@@ -67,6 +77,7 @@ class EntryFields(str, enum.Enum):
     specs = "specs"
     data_sources = "data_sources"
     none = ""
+    access_blob = "access_blob"
 
 
 class NodeStructure(pydantic.BaseModel):
@@ -78,7 +89,7 @@ class NodeStructure(pydantic.BaseModel):
 
 class SortingDirection(int, enum.Enum):
     ASCENDING = 1
-    DECENDING = -1
+    DESCENDING = -1
 
 
 class SortingItem(pydantic.BaseModel):
@@ -86,9 +97,9 @@ class SortingItem(pydantic.BaseModel):
     direction: SortingDirection
 
 
-class Spec(pydantic.BaseModel, extra="forbid", frozen=True):
-    name: Annotated[str, StringConstraints(max_length=255)]
-    version: Optional[Annotated[str, StringConstraints(max_length=255)]] = None
+# class Spec(pydantic.BaseModel, extra="forbid", frozen=True):
+#     name: Annotated[str, StringConstraints(max_length=255)]
+#     version: Optional[Annotated[str, StringConstraints(max_length=255)]] = None
 
 
 # Wait for fix https://github.com/pydantic/pydantic/issues/3957
@@ -126,6 +137,7 @@ class Revision(pydantic.BaseModel):
     revision_number: int
     metadata: dict
     specs: Specs
+    access_blob: dict
     time_updated: datetime
 
     @classmethod
@@ -136,8 +148,15 @@ class Revision(pydantic.BaseModel):
             revision_number=orm.revision_number,
             metadata=orm.metadata_,
             specs=orm.specs,
+            access_blob=orm.access_blob,
             time_updated=orm.time_updated,
         )
+
+
+class Patch(pydantic.BaseModel):
+    offset: Tuple[int, ...]
+    shape: Tuple[int, ...]
+    extend: bool
 
 
 class DataSource(pydantic.BaseModel, Generic[StructureT]):
@@ -183,6 +202,7 @@ class NodeAttributes(pydantic.BaseModel):
             TableStructure,
         ]
     ] = None
+    access_blob: Optional[Dict] = None  # free-form, access_policy-specified dict
 
     sorting: Optional[List[SortingItem]] = None
     data_sources: Optional[List[DataSource]] = None
@@ -232,7 +252,6 @@ class SparseLinks(pydantic.BaseModel):
 resource_links_type_by_structure_family = {
     StructureFamily.array: ArrayLinks,
     StructureFamily.awkward: AwkwardLinks,
-    StructureFamily.composite: ContainerLinks,
     StructureFamily.container: ContainerLinks,
     StructureFamily.sparse: SparseLinks,
     StructureFamily.table: DataFrameLinks,
@@ -305,6 +324,7 @@ class APIKey(pydantic.BaseModel):
     expiration_time: Optional[datetime] = None
     note: Optional[Annotated[str, StringConstraints(max_length=255)]] = None
     scopes: List[str]
+    access_tags: Optional[List[str]] = None
     latest_activity: Optional[datetime] = None
 
     @classmethod
@@ -314,6 +334,7 @@ class APIKey(pydantic.BaseModel):
             expiration_time=orm.expiration_time,
             note=orm.note,
             scopes=orm.scopes,
+            access_tags=orm.access_tags,
             latest_activity=orm.latest_activity,
         )
 
@@ -330,6 +351,7 @@ class APIKeyWithSecret(APIKey):
             expiration_time=orm.expiration_time,
             note=orm.note,
             scopes=orm.scopes,
+            access_tags=orm.access_tags,
             latest_activity=orm.latest_activity,
             secret=secret,
         )
@@ -399,6 +421,9 @@ class APIKeyRequestParams(pydantic.BaseModel):
     expires_in: Optional[int] = pydantic.Field(
         ..., json_schema_extra={"example": 600}
     )  # seconds
+    access_tags: Optional[List[str]] = pydantic.Field(
+        default=None, json_schema_extra={"example": ["writing_tag", "public"]}
+    )
     scopes: Optional[List[str]] = pydantic.Field(
         ..., json_schema_extra={"example": ["inherit"]}
     )
@@ -411,6 +436,7 @@ class PostMetadataRequest(pydantic.BaseModel):
     metadata: Dict = {}
     data_sources: List[DataSource] = []
     specs: Specs = []
+    access_blob: Optional[Dict] = {}
 
     # Wait for fix https://github.com/pydantic/pydantic/issues/3957
     # to do this with `unique_items` parameters to `pydantic.constr`.
@@ -424,13 +450,10 @@ class PostMetadataRequest(pydantic.BaseModel):
         return v
 
     @pydantic.model_validator(mode="after")
-    def narrow_strucutre_type(self):
+    def narrow_structure_type(self):
         "Convert the structure on each data_source from a dict to the appropriate pydantic model."
         for data_source in self.data_sources:
-            if self.structure_family not in {
-                StructureFamily.container,
-                StructureFamily.composite,
-            }:
+            if self.structure_family != StructureFamily.container:
                 structure_cls = STRUCTURE_TYPES[self.structure_family]
                 if data_source.structure is not None:
                     data_source.structure = structure_cls.from_json(
@@ -441,6 +464,7 @@ class PostMetadataRequest(pydantic.BaseModel):
 
 class PutDataSourceRequest(pydantic.BaseModel):
     data_source: DataSource
+    patch: Optional[Patch] = None
 
 
 class PostMetadataResponse(pydantic.BaseModel, Generic[ResourceLinksT]):
@@ -448,6 +472,7 @@ class PostMetadataResponse(pydantic.BaseModel, Generic[ResourceLinksT]):
     links: Union[ArrayLinks, DataFrameLinks, SparseLinks]
     metadata: Dict
     data_sources: List[DataSource]
+    access_blob: Dict
 
 
 class PutMetadataResponse(pydantic.BaseModel, Generic[ResourceLinksT]):
@@ -456,6 +481,7 @@ class PutMetadataResponse(pydantic.BaseModel, Generic[ResourceLinksT]):
     # May be None if not altered
     metadata: Optional[Dict] = None
     data_sources: Optional[List[DataSource]] = None
+    access_blob: Optional[Dict] = None
 
 
 class DistinctValueInfo(pydantic.BaseModel):
@@ -473,6 +499,7 @@ class PutMetadataRequest(pydantic.BaseModel):
     # These fields are optional because None means "no changes; do not update".
     metadata: Optional[Dict] = None
     specs: Optional[Specs] = None
+    access_blob: Optional[Dict] = None
 
     # Wait for fix https://github.com/pydantic/pydantic/issues/3957
     # to do this with `unique_items` parameters to `pydantic.constr`.
@@ -522,6 +549,13 @@ class PatchMetadataRequest(HyphenizedBaseModel):
         union_mode="left_to_right"
     )
 
+    # These fields are optional because None means "no changes; do not update".
+    # Dict for merge-patch:
+    # Define an alias to override parent class alias generator
+    access_blob: Optional[Union[List[JSONPatchAny], Dict]] = Field(
+        alias="access_blob", default=None
+    )
+
     @pydantic.field_validator("specs")
     def specs_uniqueness_validator(cls, v):
         if v is None:
@@ -547,6 +581,17 @@ class PatchMetadataResponse(pydantic.BaseModel, Generic[ResourceLinksT]):
     # May be None if not altered
     metadata: Optional[Dict]
     data_sources: Optional[List[DataSource]]
+    access_blob: Optional[Dict]
+
+
+SearchResponse = Response[
+    List[Resource[NodeAttributes, Dict, Dict]], PaginationLinks, Dict
+]
+
+
+class EnvelopeFormat(str, enum.Enum):
+    json = "json"
+    msgpack = "msgpack"
 
 
 NodeStructure.model_rebuild()

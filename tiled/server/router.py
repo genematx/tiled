@@ -1,19 +1,33 @@
+import collections
 import dataclasses
 import inspect
 import os
 import re
 import warnings
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
-from typing import Callable, List, Optional, TypeVar, Union
+from typing import Callable, List, Optional, Set, TypeVar, Union
 
 import anyio
 import packaging
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Security
+import pydantic_settings
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    Security,
+    WebSocket,
+)
 from jmespath.exceptions import JMESPathError
 from json_merge_patch import merge as apply_merge_patch
 from jsonpatch import apply_patch as apply_json_patch
+from starlette.requests import URL
 from starlette.status import (
     HTTP_200_OK,
     HTTP_206_PARTIAL_CONTENT,
@@ -27,25 +41,30 @@ from starlette.status import (
     HTTP_422_UNPROCESSABLE_ENTITY,
 )
 
-from tiled.adapters.mapping import MapAdapter
+from tiled.adapters.protocols import AnyAdapter
 from tiled.media_type_registration import SerializationRegistry
 from tiled.query_registration import QueryRegistry
 from tiled.schemas import About
 from tiled.server.protocols import ExternalAuthenticator, InternalAuthenticator
+from tiled.server.schemas import Principal
 
 from .. import __version__
 from ..ndslice import NDSlice
 from ..structures.core import Spec, StructureFamily
-from ..utils import (
-    BrokenLink,
-    SpecialUsers,
-    ensure_awaitable,
-    patch_mimetypes,
-    path_from_uri,
-)
+from ..type_aliases import Scopes
+from ..utils import BrokenLink, ensure_awaitable, patch_mimetypes, path_from_uri
 from ..validation_registration import ValidationError, ValidationRegistry
 from . import schemas
-from .authentication import get_current_principal
+from .authentication import (
+    check_scopes,
+    get_current_access_tags,
+    get_current_access_tags_websocket,
+    get_current_principal,
+    get_current_principal_websocket,
+    get_current_scopes,
+    get_current_scopes_websocket,
+    get_session_state,
+)
 from .core import (
     DEFAULT_PAGE_SIZE,
     DEPTH_LIMIT,
@@ -58,14 +77,27 @@ from .core import (
     construct_entries_response,
     construct_resource,
     construct_revisions_response,
+    get_websocket_envelope_formatter,
     json_or_msgpack,
     resolve_media_type,
 )
-from .dependencies import block, expected_shape, get_entry, offset_param, shape_param
+from .dependencies import (
+    block,
+    expected_shape,
+    get_entry,
+    get_root_tree,
+    offset_param,
+    shape_param,
+)
 from .file_response_with_range import FileResponseWithRange
 from .links import links_for_node
 from .settings import Settings, get_settings
-from .utils import filter_for_access, get_base_url, record_timing
+from .utils import (
+    filter_for_access,
+    get_base_url,
+    get_base_url_websocket,
+    record_timing,
+)
 
 T = TypeVar("T")
 
@@ -264,17 +296,28 @@ def get_router(
         max_depth: Optional[int] = Query(None, ge=0, le=DEPTH_LIMIT),
         omit_links: bool = Query(False),
         include_data_sources: bool = Query(False),
-        entry: MapAdapter = Security(get_entry(), scopes=["read:metadata"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        settings: Settings = Depends(get_settings),
+        _=Security(check_scopes, scopes=["read:metadata"]),
         **filters,
     ):
+        entry = await get_entry(
+            path,
+            ["read:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.container},
+            getattr(request.app.state, "access_policy", None),
+        )
         request.state.endpoint = "search"
-        if entry.structure_family not in {
-            StructureFamily.container,
-            StructureFamily.composite,
-        }:
-            raise WrongTypeForRoute(
-                "This is not a Node; it cannot be searched or listed."
-            )
         try:
             (
                 resource,
@@ -296,6 +339,7 @@ def get_router(
                 get_base_url(request),
                 resolve_media_type(request),
                 max_depth=max_depth,
+                exact_count_limit=settings.exact_count_limit,
             )
             # We only get one Expires header, so if different parts
             # of this response become stale at different times, we
@@ -332,14 +376,32 @@ def get_router(
     )
     @_patch_route_signature(query_registry)
     async def distinct(
+        path: str,
         request: Request,
         structure_families: bool = False,
         specs: bool = False,
         metadata: Optional[List[str]] = Query(default=[]),
         counts: bool = False,
-        entry: MapAdapter = Security(get_entry(), scopes=["read:metadata"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:metadata"]),
         **filters,
     ):
+        entry = await get_entry(
+            path,
+            ["read:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if hasattr(entry, "get_distinct"):
             filtered = await apply_search(entry, filters, query_registry)
             distinct = await ensure_awaitable(
@@ -371,10 +433,27 @@ def get_router(
         omit_links: bool = Query(False),
         include_data_sources: bool = Query(False),
         root_path: bool = Query(False),
-        entry: MapAdapter = Security(get_entry(), scopes=["read:metadata"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        settings: Settings = Depends(get_settings),
+        _=Security(check_scopes, scopes=["read:metadata"]),
     ):
         """Fetch the metadata and structure information for one entry"""
-
+        entry = await get_entry(
+            path,
+            ["read:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         request.state.endpoint = "metadata"
         base_url = get_base_url(request)
         path_parts = [segment for segment in path.split("/") if segment]
@@ -389,6 +468,7 @@ def get_router(
                 include_data_sources,
                 resolve_media_type(request),
                 max_depth=max_depth,
+                exact_count_limit=settings.exact_count_limit,
             )
         except BrokenLink as err:
             raise HTTPException(status_code=HTTP_410_GONE, detail=err.args[0])
@@ -410,20 +490,35 @@ def get_router(
     )
     async def array_block(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.array, StructureFamily.sparse}),
-            scopes=["read:data"],
-        ),
+        path: str,
         block=Depends(block),
         slice=Depends(NDSlice.from_query),
         expected_shape=Depends(expected_shape),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch a chunk of array-like data.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.array, StructureFamily.sparse},
+            getattr(request.app.state, "access_policy", None),
+        )
         shape = entry.structure().shape
         # Check that block dimensionality matches array dimensionality.
         ndim = len(shape)
@@ -486,20 +581,35 @@ def get_router(
         "/array/full/{path:path}", response_model=schemas.Response, name="full array"
     )
     async def array_full(
+        path: str,
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.array, StructureFamily.sparse}),
-            scopes=["read:data"],
-        ),
         slice=Depends(NDSlice.from_query),
         expected_shape=Depends(expected_shape),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch a slice of array-like data.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.array, StructureFamily.sparse},
+            getattr(request.app.state, "access_policy", None),
+        )
         structure_family = entry.structure_family
         # Deferred import because this is not a required dependency of the server
         # for some use cases.
@@ -543,26 +653,112 @@ def get_router(
         except UnsupportedMediaTypes as err:
             raise HTTPException(status_code=HTTP_406_NOT_ACCEPTABLE, detail=err.args[0])
 
+    @router.delete("/stream/close/{path:path}")
+    async def close_stream(
+        request: Request,
+        path: str,
+        principal: Optional[schemas.Principal] = Depends(get_current_principal),
+        root_tree: pydantic_settings.BaseSettings = Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
+    ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.array, StructureFamily.sparse},
+            getattr(request.app.state, "access_policy", None),
+        )
+        await entry.close_stream()
+
+    @router.websocket("/stream/single/{path:path}")
+    async def websocket_endpoint(
+        websocket: WebSocket,
+        path: str,
+        envelope_format: schemas.EnvelopeFormat = schemas.EnvelopeFormat.json,
+        start: Optional[int] = None,
+        principal: Optional[schemas.Principal] = Depends(
+            get_current_principal_websocket
+        ),
+        authn_access_tags: Optional[Set[str]] = Depends(
+            get_current_access_tags_websocket
+        ),
+        authn_scopes: Scopes = Depends(get_current_scopes_websocket),
+    ):
+        root_tree = websocket.app.state.root_tree
+        websocket.state.metrics = collections.defaultdict(
+            lambda: collections.defaultdict(lambda: 0)
+        )
+        entry = await get_entry(
+            path,
+            ["read:data", "read:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            {},  # session_state,
+            websocket.state.metrics,
+            {
+                StructureFamily.array,
+                StructureFamily.container,
+                StructureFamily.sparse,
+            },
+            getattr(websocket.app.state, "access_policy", None),
+        )
+        formatter = get_websocket_envelope_formatter(
+            envelope_format, entry, deserialization_registry
+        )
+        base_websocket_url = URL(get_base_url_websocket(websocket))
+        scheme = "https" if base_websocket_url.scheme == "wss" else "http"
+        path_parts = [segment for segment in path.split("/") if segment]
+        path_str = "/".join(path_parts)
+        uri = f"{base_websocket_url.replace(scheme=scheme)}/array/full/{path_str}"
+        handler = entry.make_ws_handler(websocket, formatter, uri)
+        await handler(start)
+
     @router.get(
         "/table/partition/{path:path}",
         response_model=schemas.Response,
         name="table partition",
     )
     async def get_table_partition(
+        path: str,
         request: Request,
         partition: int,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.table}), scopes=["read:data"]
-        ),
         column: Optional[List[str]] = Query(None, min_length=1),
         field: Optional[List[str]] = Query(None, min_length=1, deprecated=True),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch a partition (continuous block of rows) from a DataFrame [GET route].
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.table},
+            getattr(request.app.state, "access_policy", None),
+        )
         if (field is not None) and (column is not None):
             redundant_field_and_column = " ".join(
                 (
@@ -598,19 +794,35 @@ def get_router(
         name="table partition",
     )
     async def post_table_partition(
+        path: str,
         request: Request,
         partition: int,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.table}), scopes=["read:data"]
-        ),
         column: Optional[List[str]] = Body(None, min_length=1),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch a partition (continuous block of rows) from a DataFrame [POST route].
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.table},
+            getattr(request.app.state, "access_policy", None),
+        )
         return await table_partition(
             request=request,
             partition=partition,
@@ -624,7 +836,7 @@ def get_router(
     async def table_partition(
         request: Request,
         partition: int,
-        entry: MapAdapter,
+        entry: AnyAdapter,
         column: Optional[List[str]],
         format: Optional[str],
         filename: Optional[str],
@@ -679,17 +891,33 @@ def get_router(
     )
     async def get_table_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.table}), scopes=["read:data"]
-        ),
+        path: str,
         column: Optional[List[str]] = Query(None, min_length=1),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch the data for the given table [GET route].
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.table},
+            getattr(request.app.state, "access_policy", None),
+        )
         return await table_full(
             request=request,
             entry=entry,
@@ -706,17 +934,33 @@ def get_router(
     )
     async def post_table_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.table}), scopes=["read:data"]
-        ),
+        path: str,
         column: Optional[List[str]] = Body(None, min_length=1),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch the data for the given table [POST route].
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.table},
+            getattr(request.app.state, "access_policy", None),
+        )
         return await table_full(
             request=request,
             entry=entry,
@@ -728,7 +972,7 @@ def get_router(
 
     async def table_full(
         request: Request,
-        entry: MapAdapter,
+        entry: AnyAdapter,
         column: Optional[List[str]],
         format: Optional[str],
         filename: Optional[str],
@@ -778,24 +1022,38 @@ def get_router(
     )
     async def get_container_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.container, StructureFamily.composite}),
-            scopes=["read:data"],
-        ),
-        principal: Union[schemas.Principal, SpecialUsers] = Depends(
-            get_current_principal
-        ),
+        path: str,
+        principal: Optional[Principal] = Depends(get_current_principal),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
         field: Optional[List[str]] = Query(None, min_length=1),
         format: Optional[str] = None,
         filename: Optional[str] = None,
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch the data for the given container via a GET request.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.container},
+            getattr(request.app.state, "access_policy", None),
+        )
         return await container_full(
             request=request,
             entry=entry,
             principal=principal,
+            authn_access_tags=authn_access_tags,
+            authn_scopes=authn_scopes,
             field=field,
             format=format,
             filename=filename,
@@ -808,24 +1066,38 @@ def get_router(
     )
     async def post_container_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.container, StructureFamily.composite}),
-            scopes=["read:data"],
-        ),
-        principal: Union[schemas.Principal, SpecialUsers] = Depends(
-            get_current_principal
-        ),
+        path: str,
+        principal: Optional[Principal] = Depends(get_current_principal),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
         field: Optional[List[str]] = Body(None, min_length=1),
         format: Optional[str] = None,
         filename: Optional[str] = None,
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch the data for the given container via a POST request.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.container},
+            getattr(request.app.state, "access_policy", None),
+        )
         return await container_full(
             request=request,
             entry=entry,
             principal=principal,
+            authn_access_tags=authn_access_tags,
+            authn_scopes=authn_scopes,
             field=field,
             format=format,
             filename=filename,
@@ -834,7 +1106,9 @@ def get_router(
     async def container_full(
         request: Request,
         entry,
-        principal: str,
+        principal: Optional[Principal],
+        authn_access_tags: Optional[Set[str]],
+        authn_scopes: Scopes,
         field: Optional[List[str]],
         format: Optional[str],
         filename: Optional[str],
@@ -852,7 +1126,10 @@ def get_router(
             )
         curried_filter = partial(
             filter_for_access,
+            access_policy=request.app.state.access_policy,
             principal=principal,
+            authn_access_tags=authn_access_tags,
+            authn_scopes=authn_scopes,
             scopes=["read:data"],
             metrics=request.state.metrics,
         )
@@ -882,27 +1159,33 @@ def get_router(
     )
     async def node_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry(
-                {
-                    StructureFamily.table,
-                    StructureFamily.container,
-                    StructureFamily.composite,
-                }
-            ),
-            scopes=["read:data"],
-        ),
-        principal: Union[schemas.Principal, SpecialUsers] = Depends(
-            get_current_principal
-        ),
+        path: str,
+        principal: Optional[Principal] = Depends(get_current_principal),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
         field: Optional[List[str]] = Query(None, min_length=1),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch the data below the given node.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.table, StructureFamily.container},
+            getattr(request.app.state, "access_policy", None),
+        )
         try:
             with record_timing(request.state.metrics, "read"):
                 data = await ensure_awaitable(entry.read, field)
@@ -922,13 +1205,13 @@ def get_router(
                     "request a smaller chunks."
                 ),
             )
-        if entry.structure_family in {
-            StructureFamily.container,
-            StructureFamily.composite,
-        }:
+        if entry.structure_family == StructureFamily.container:
             curried_filter = partial(
                 filter_for_access,
+                access_policy=request.app.state.access_policy,
                 principal=principal,
+                authn_access_tags=authn_access_tags,
+                authn_scopes=authn_scopes,
                 scopes=["read:data"],
                 metrics=request.state.metrics,
             )
@@ -959,13 +1242,17 @@ def get_router(
     )
     async def get_awkward_buffers(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.awkward}), scopes=["read:data"]
-        ),
+        path: str,
         form_key: Optional[List[str]] = Query(None, min_length=1),
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch a slice of AwkwardArray data.
@@ -977,6 +1264,18 @@ def get_router(
         one, but this is a pragmatic measure.) For requests with large numbers of
         form_key parameters, POST may be the only option.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.awkward},
+            getattr(request.app.state, "access_policy", None),
+        )
         return await _awkward_buffers(
             request=request,
             entry=entry,
@@ -993,13 +1292,17 @@ def get_router(
     )
     async def post_awkward_buffers(
         request: Request,
+        path: str,
         body: List[str],
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.awkward}), scopes=["read:data"]
-        ),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch a slice of AwkwardArray data.
@@ -1011,6 +1314,18 @@ def get_router(
         one, but this is a pragmatic measure.) For requests with large numbers of
         form_key parameters, POST may be the only option.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.awkward},
+            getattr(request.app.state, "access_policy", None),
+        )
         return await _awkward_buffers(
             request=request,
             entry=entry,
@@ -1069,17 +1384,32 @@ def get_router(
     )
     async def awkward_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.awkward}), scopes=["read:data"]
-        ),
-        # slice=Depends(NDSlice.from_query),
+        path: str,
         format: Optional[str] = None,
         filename: Optional[str] = None,
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
         """
         Fetch a slice of AwkwardArray data.
         """
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.awkward},
+            getattr(request.app.state, "access_policy", None),
+        )
         structure_family = entry.structure_family
         # Deferred import because this is not a required dependency of the server
         # for some use cases.
@@ -1120,13 +1450,30 @@ def get_router(
         path: str,
         body: schemas.PostMetadataRequest,
         settings: Settings = Depends(get_settings),
-        entry: MapAdapter = Security(get_entry(), scopes=["write:metadata", "create"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        _=Security(check_scopes, scopes=["write:metadata", "create"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:metadata", "create"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         for data_source in body.data_sources:
             if data_source.assets:
                 raise HTTPException(
                     "Externally-managed assets cannot be registered "
-                    "using POST /metadata/{path} Use POST /register/{path} instead."
+                    "using POST /metadata/{path}. Use POST /register/{path} instead."
                 )
         if body.data_sources and not getattr(entry, "writable", False):
             raise HTTPException(
@@ -1139,6 +1486,9 @@ def get_router(
             body=body,
             settings=settings,
             entry=entry,
+            principal=principal,
+            authn_access_tags=authn_access_tags,
+            authn_scopes=authn_scopes,
         )
 
     @router.post("/register/{path:path}", response_model=schemas.PostMetadataResponse)
@@ -1147,16 +1497,34 @@ def get_router(
         path: str,
         body: schemas.PostMetadataRequest,
         settings: Settings = Depends(get_settings),
-        entry: MapAdapter = Security(
-            get_entry(), scopes=["write:metadata", "create", "register"]
-        ),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        _=Security(check_scopes, scopes=["write:metadata", "create", "register"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:metadata", "create", "register"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         return await _create_node(
             request=request,
             path=path,
             body=body,
             settings=settings,
             entry=entry,
+            principal=principal,
+            authn_access_tags=authn_access_tags,
+            authn_scopes=authn_scopes,
         )
 
     async def _create_node(
@@ -1165,44 +1533,72 @@ def get_router(
         body: schemas.PostMetadataRequest,
         settings: Settings,
         entry,
+        principal: Optional[Principal],
+        authn_access_tags: Optional[Set[str]],
+        authn_scopes: Scopes,
     ):
-        metadata, structure_family, specs = (
+        metadata, structure_family, specs, access_blob = (
             body.metadata,
             body.structure_family,
             body.specs,
+            body.access_blob,
         )
-        if structure_family in {StructureFamily.container, StructureFamily.composite}:
+        if structure_family == StructureFamily.container:
             structure = None
         else:
             if len(body.data_sources) != 1:
                 raise NotImplementedError
             structure = body.data_sources[0].structure
 
-        metadata_modified, metadata = await validate_metadata(
+        key = body.id or entry.context.key_maker()
+        metadata_modified, metadata = await validate_specs(
+            specs=specs,
             metadata=metadata,
+            entry=None,  # the node doesn't exist yet
             structure_family=structure_family,
             structure=structure,
-            specs=specs,
             settings=settings,
         )
 
-        key, node = await entry.create_node(
+        if request.app.state.access_policy is not None and hasattr(
+            request.app.state.access_policy, "init_node"
+        ):
+            try:
+                (
+                    access_blob_modified,
+                    access_blob,
+                ) = await request.app.state.access_policy.init_node(
+                    principal, authn_access_tags, authn_scopes, access_blob=access_blob
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=HTTP_403_FORBIDDEN,
+                    detail=f"Access policy rejects the provided access blob.\n{e}",
+                )
+        else:
+            access_blob_modified = access_blob != {}
+            access_blob = {}
+
+        node = await entry.create_node(
             metadata=body.metadata,
             structure_family=body.structure_family,
-            key=body.id,
+            key=key,
             specs=body.specs,
             data_sources=body.data_sources,
+            access_blob=access_blob,
         )
         links = links_for_node(
-            structure_family, structure, get_base_url(request), path + f"/{key}"
+            structure_family, structure, get_base_url(request), path + f"/{node.key}"
         )
         response_data = {
-            "id": key,
+            "id": node.key,
             "links": links,
             "data_sources": [ds.model_dump() for ds in node.data_sources],
         }
         if metadata_modified:
             response_data["metadata"] = metadata
+        if access_blob_modified:
+            response_data["access_blob"] = access_blob
 
         return json_or_msgpack(request, response_data)
 
@@ -1210,26 +1606,64 @@ def get_router(
     async def put_data_source(
         request: Request,
         path: str,
-        data_source: int,
         body: schemas.PutDataSourceRequest,
         settings: Settings = Depends(get_settings),
-        entry: MapAdapter = Security(
-            get_entry(), scopes=["write:metadata", "register"]
-        ),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:metadata", "register"]),
     ):
-        await entry.put_data_source(
-            data_source=body.data_source,
+        entry = await get_entry(
+            path,
+            ["write:metadata", "register"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
         )
+        await entry.put_data_source(data_source=body.data_source, patch=body.patch)
 
     @router.delete("/metadata/{path:path}")
     async def delete(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry(), scopes=["write:data", "write:metadata"]
+        path: str,
+        recursive: Optional[bool] = Query(
+            False, description="Delete children recursively"
         ),
+        external_only: Optional[bool] = Query(
+            True,
+            description=(
+                "Delete the node, but only if this would not "
+                "affect any internally-managed data sources"
+            ),
+        ),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data", "write:metadata"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data", "write:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if hasattr(entry, "delete"):
-            await entry.delete()
+            await entry.delete(recursive=recursive, external_only=external_only)
         else:
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
@@ -1237,30 +1671,29 @@ def get_router(
             )
         return json_or_msgpack(request, None)
 
-    @router.delete("/nodes/{path:path}")
-    async def bulk_delete(
-        request: Request,
-        entry: MapAdapter = Security(
-            get_entry(), scopes=["write:data", "write:metadata"]
-        ),
-    ):
-        if hasattr(entry, "delete_tree"):
-            await entry.delete_tree()
-        else:
-            raise HTTPException(
-                status_code=HTTP_405_METHOD_NOT_ALLOWED,
-                detail="This node does not support bulk deletion.",
-            )
-        return json_or_msgpack(request, None)
-
     @router.put("/array/full/{path:path}")
     async def put_array_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.array, StructureFamily.sparse}),
-            scopes=["write:data"],
-        ),
+        path: str,
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.array, StructureFamily.sparse},
+            getattr(request.app.state, "access_policy", None),
+        )
         body = await request.body()
         if not hasattr(entry, "write"):
             raise HTTPException(
@@ -1269,85 +1702,118 @@ def get_router(
             )
         media_type = request.headers["content-type"]
         if entry.structure_family == "array":
-            dtype = entry.structure().data_type.to_numpy_dtype()
-            shape = entry.structure().shape
             deserializer = deserialization_registry.dispatch("array", media_type)
-            data = await ensure_awaitable(deserializer, body, dtype, shape)
         elif entry.structure_family == "sparse":
             deserializer = deserialization_registry.dispatch("sparse", media_type)
-            data = await ensure_awaitable(deserializer, body)
         else:
             raise NotImplementedError(entry.structure_family)
-        await ensure_awaitable(entry.write, data)
+        await ensure_awaitable(entry.write, media_type, deserializer, entry, body)
         return json_or_msgpack(request, None)
 
     @router.put("/array/block/{path:path}")
     async def put_array_block(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.array, StructureFamily.sparse}),
-            scopes=["write:data"],
-        ),
+        path: str,
         block=Depends(block),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.array, StructureFamily.sparse},
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "write_block"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
                 detail="This node cannot accept array data.",
             )
-        from tiled.adapters.array import slice_and_shape_from_block_and_chunks
 
         body = await request.body()
         media_type = request.headers["content-type"]
-        if entry.structure_family == "array":
-            dtype = entry.structure().data_type.to_numpy_dtype()
-            _, shape = slice_and_shape_from_block_and_chunks(
-                block, entry.structure().chunks
-            )
-            deserializer = deserialization_registry.dispatch("array", media_type)
-            data = await ensure_awaitable(deserializer, body, dtype, shape)
-        elif entry.structure_family == "sparse":
-            deserializer = deserialization_registry.dispatch("sparse", media_type)
-            data = await ensure_awaitable(deserializer, body)
-        else:
-            raise NotImplementedError(entry.structure_family)
-        await ensure_awaitable(entry.write_block, data, block)
+        deserializer = deserialization_registry.dispatch(
+            entry.structure_family, media_type
+        )
+        await ensure_awaitable(
+            entry.write_block, block, media_type, deserializer, entry, body
+        )
         return json_or_msgpack(request, None)
 
     @router.patch("/array/full/{path:path}")
     async def patch_array_full(
         request: Request,
+        path: str,
         offset=Depends(offset_param),
         shape=Depends(shape_param),
         extend: bool = False,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.array}),
-            scopes=["write:data"],
-        ),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.array},
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "patch"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
                 detail="This node cannot accept array data.",
             )
 
-        dtype = entry.structure().data_type.to_numpy_dtype()
         body = await request.body()
         media_type = request.headers["content-type"]
         deserializer = deserialization_registry.dispatch("array", media_type)
-        data = await ensure_awaitable(deserializer, body, dtype, shape)
-        structure = await ensure_awaitable(entry.patch, data, offset, extend)
+        structure = await ensure_awaitable(
+            entry.patch, shape, offset, extend, media_type, deserializer, entry, body
+        )
         return json_or_msgpack(request, structure)
 
     @router.put("/table/full/{path:path}")
     @router.put("/node/full/{path:path}", deprecated=True)
     async def put_node_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.table}),
-            scopes=["write:data"],
-        ),
+        path: str,
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.table},
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "write"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
@@ -1365,9 +1831,27 @@ def get_router(
     @router.put("/table/partition/{path:path}")
     async def put_table_partition(
         partition: int,
+        path: str,
         request: Request,
-        entry: MapAdapter = Security(get_entry(), scopes=["write:data"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "write_partition"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
@@ -1379,15 +1863,33 @@ def get_router(
             StructureFamily.table, media_type
         )
         data = await ensure_awaitable(deserializer, body)
-        await ensure_awaitable(entry.write_partition, data, partition)
+        await ensure_awaitable(entry.write_partition, partition, data)
         return json_or_msgpack(request, None)
 
     @router.patch("/table/partition/{path:path}")
     async def patch_table_partition(
         partition: int,
+        path: str,
         request: Request,
-        entry: MapAdapter = Security(get_entry(), scopes=["write:data"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "write_partition"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
@@ -1399,16 +1901,32 @@ def get_router(
             StructureFamily.table, media_type
         )
         data = await ensure_awaitable(deserializer, body)
-        await ensure_awaitable(entry.append_partition, data, partition)
+        await ensure_awaitable(entry.append_partition, partition, data)
         return json_or_msgpack(request, None)
 
     @router.put("/awkward/full/{path:path}")
     async def put_awkward_full(
         request: Request,
-        entry: MapAdapter = Security(
-            get_entry({StructureFamily.awkward}), scopes=["write:data"]
-        ),
+        path: str,
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.awkward},
+            getattr(request.app.state, "access_policy", None),
+        )
         body = await request.body()
         if not hasattr(entry, "write"):
             raise HTTPException(
@@ -1429,18 +1947,39 @@ def get_router(
     @router.patch("/metadata/{path:path}", response_model=schemas.PatchMetadataResponse)
     async def patch_metadata(
         request: Request,
+        path: str,
         body: schemas.PatchMetadataRequest,
         settings: Settings = Depends(get_settings),
-        entry: MapAdapter = Security(get_entry(), scopes=["write:metadata"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        drop_revision: bool = False,
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        _=Security(check_scopes, scopes=["write:metadata"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "replace_metadata"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
                 detail="This node does not support update of metadata.",
             )
+
         if body.content_type == patch_mimetypes.JSON_PATCH:
             metadata = apply_json_patch(entry.metadata(), (body.metadata or []))
             specs = apply_json_patch((entry.specs or []), (body.specs or []))
+            access_blob = apply_json_patch(entry.access_blob, (body.access_blob or []))
         elif body.content_type == patch_mimetypes.MERGE_PATCH:
             metadata = apply_merge_patch(entry.metadata(), (body.metadata or {}))
             # body.specs = [] clears specs, as per json merge patch specification
@@ -1448,6 +1987,15 @@ def get_router(
             current_specs = entry.specs or []
             target_specs = current_specs if body.specs is None else body.specs
             specs = apply_merge_patch(current_specs, target_specs)
+            # json_merge_patch applies merge in-place, which would
+            # otherwise modify the in-memory node and prevent the
+            # access policy from sanity checking the access blob.
+            # make a copy so we can compare the node against the
+            # proposed new access blob.
+            entry_access_blob_copy = deepcopy(entry.access_blob)
+            access_blob = apply_merge_patch(
+                entry_access_blob_copy, (body.access_blob or [])
+            )
         else:
             raise HTTPException(
                 status_code=HTTP_406_NOT_ACCEPTABLE,
@@ -1466,59 +2014,124 @@ def get_router(
                 detail="Update cannot result in non-unique specs",
             )
 
-        structure_family, structure = (
-            entry.structure_family,
-            entry.structure(),
-        )
-
-        metadata_modified, metadata = await validate_metadata(
+        metadata_modified, metadata = await validate_specs(
+            specs=specs,
             metadata=metadata,
-            structure_family=structure_family,
-            structure=structure,
-            specs=[Spec(x) for x in specs],
+            entry=entry,
             settings=settings,
         )
 
-        await entry.replace_metadata(metadata=metadata, specs=specs)
+        if request.app.state.access_policy is not None and hasattr(
+            request.app.state.access_policy, "modify_node"
+        ):
+            try:
+                (
+                    access_blob_modified,
+                    access_blob,
+                ) = await request.app.state.access_policy.modify_node(
+                    entry, principal, authn_access_tags, authn_scopes, access_blob
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=HTTP_403_FORBIDDEN,
+                    detail=f"Access policy rejects the provided access blob.\n{e}",
+                )
+        else:
+            # Cannot modify the access blob if there is no access policy
+            access_blob_modified = access_blob != entry.access_blob
+            access_blob = entry.access_blob
 
-        response_data = {"id": entry.key}
+        await entry.replace_metadata(
+            metadata=metadata,
+            specs=specs,
+            access_blob=access_blob,
+            drop_revision=drop_revision,
+        )
+
+        response_data = {"id": entry.node.key}
         if metadata_modified:
             response_data["metadata"] = metadata
+        if access_blob_modified:
+            response_data["access_blob"] = access_blob
         return json_or_msgpack(request, response_data)
 
     @router.put("/metadata/{path:path}", response_model=schemas.PutMetadataResponse)
     async def put_metadata(
         request: Request,
+        path: str,
         body: schemas.PutMetadataRequest,
         settings: Settings = Depends(get_settings),
-        entry: MapAdapter = Security(get_entry(), scopes=["write:metadata"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        drop_revision: bool = False,
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        _=Security(check_scopes, scopes=["write:metadata"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "replace_metadata"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
                 detail="This node does not support update of metadata.",
             )
 
-        metadata, structure_family, structure, specs = (
+        metadata, specs, access_blob = (
             body.metadata if body.metadata is not None else entry.metadata(),
-            entry.structure_family,
-            entry.structure(),
             body.specs if body.specs is not None else entry.specs,
+            body.access_blob if body.access_blob is not None else entry.access_blob,
         )
 
-        metadata_modified, metadata = await validate_metadata(
-            metadata=metadata,
-            structure_family=structure_family,
-            structure=structure,
+        metadata_modified, metadata = await validate_specs(
             specs=specs,
+            metadata=metadata,
+            entry=entry,
             settings=settings,
         )
 
-        await entry.replace_metadata(metadata=metadata, specs=specs)
+        if request.app.state.access_policy is not None and hasattr(
+            request.app.state.access_policy, "modify_node"
+        ):
+            try:
+                (
+                    access_blob_modified,
+                    access_blob,
+                ) = await request.app.state.access_policy.modify_node(
+                    entry, principal, authn_access_tags, authn_scopes, access_blob
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=HTTP_403_FORBIDDEN,
+                    detail=f"Access policy rejects the provided access blob.\n{e}",
+                )
+        else:
+            # Cannot modify the access blob if there is no access policy
+            access_blob_modified = access_blob != entry.access_blob
+            access_blob = entry.access_blob
 
-        response_data = {"id": entry.key}
+        await entry.replace_metadata(
+            metadata=metadata,
+            specs=specs,
+            access_blob=access_blob,
+            drop_revision=drop_revision,
+        )
+
+        response_data = {"id": entry.node.key}
         if metadata_modified:
             response_data["metadata"] = metadata
+        if access_blob_modified:
+            response_data["access_blob"] = access_blob
         return json_or_msgpack(request, response_data)
 
     @router.get("/revisions/{path:path}")
@@ -1529,8 +2142,25 @@ def get_router(
         limit: Optional[int] = Query(
             DEFAULT_PAGE_SIZE, alias="page[limit]", ge=0, le=MAX_PAGE_SIZE
         ),
-        entry: MapAdapter = Security(get_entry(), scopes=["read:metadata"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:metadata"]),
     ):
+        entry = await get_entry(
+            path,
+            ["read:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "revisions"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
@@ -1552,9 +2182,27 @@ def get_router(
     @router.delete("/revisions/{path:path}")
     async def delete_revision(
         request: Request,
+        path: str,
         number: int,
-        entry: MapAdapter = Security(get_entry(), scopes=["write:metadata"]),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:metadata"]),
     ):
+        entry = await get_entry(
+            path,
+            ["write:metadata"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )
         if not hasattr(entry, "revisions"):
             raise HTTPException(
                 status_code=HTTP_405_METHOD_NOT_ALLOWED,
@@ -1572,13 +2220,29 @@ def get_router(
     @router.get("/asset/bytes/{path:path}")
     async def get_asset(
         request: Request,
+        path: str,
         id: int,
         relative_path: Optional[Path] = None,
-        entry: MapAdapter = Security(
-            get_entry(), scopes=["read:data"]
-        ),  # TODO: Separate scope for assets?
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )  # TODO: Separate scope for assets?
         if not settings.expose_raw_assets:
             raise HTTPException(
                 status_code=HTTP_403_FORBIDDEN,
@@ -1671,12 +2335,28 @@ def get_router(
     @router.get("/asset/manifest/{path:path}")
     async def get_asset_manifest(
         request: Request,
+        path: str,
         id: int,
-        entry: MapAdapter = Security(
-            get_entry(), scopes=["read:data"]
-        ),  # TODO: Separate scope for assets?
         settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[Set[str]] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
     ):
+        entry = await get_entry(
+            path,
+            ["read:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            None,
+            getattr(request.app.state, "access_policy", None),
+        )  # TODO: Separate scope for assets?
         if not settings.expose_raw_assets:
             raise HTTPException(
                 status_code=HTTP_403_FORBIDDEN,
@@ -1715,11 +2395,12 @@ def get_router(
             manifest.extend(Path(root, file) for file in files)
         return json_or_msgpack(request, {"manifest": manifest})
 
-    async def validate_metadata(
-        metadata: dict,
-        structure_family: StructureFamily,
-        structure,
+    async def validate_specs(
         specs: List[Spec],
+        metadata: dict,
+        entry: Optional[AnyAdapter] = None,
+        structure_family: Optional[StructureFamily] = None,
+        structure: Optional[dict] = None,
         settings: Settings = Depends(get_settings),
     ):
         metadata_modified = False
@@ -1733,25 +2414,67 @@ def get_router(
         # For now we leave it to the server maintainer to ensure that validators
         # won't step on each other in this way, but this may need revisiting.
         for spec in reversed(specs):
-            if spec.name not in validation_registry:
+            if spec not in validation_registry:
                 if settings.reject_undeclared_specs:
                     raise HTTPException(
                         status_code=HTTP_400_BAD_REQUEST,
                         detail=f"Unrecognized spec: {spec.name}",
                     )
             else:
-                validator = validation_registry(spec.name)
+                validator = validation_registry(spec)
                 try:
-                    result = validator(metadata, structure_family, structure, spec)
+                    result = await ensure_awaitable(
+                        validator, spec, metadata, entry, structure_family, structure
+                    )
                 except ValidationError as e:
                     raise HTTPException(
                         status_code=HTTP_400_BAD_REQUEST,
-                        detail=f"failed validation for spec {spec.name}:\n{e}",
+                        detail=f"failed validation for the {spec.name} spec:\n{e}",
                     )
                 if result is not None:
                     metadata_modified = True
                     metadata = result
 
         return metadata_modified, metadata
+
+    return router
+
+
+def get_metrics_router() -> APIRouter:
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+    router = APIRouter()
+
+    @cache
+    def prometheus_registry():
+        """
+        Configure prometheus_client.
+
+        This is run the first time the /metrics endpoint is used. The enclosing scope of
+        `get_metrics_router` would normally be created only once (during the app startup),
+        so this function would also be run only once and the registry would be cached.
+        """
+        if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+            # The multiprocess configuration makes it compatible with gunicorn.
+            # https://github.com/prometheus/client_python/#multiprocess-mode-eg-gunicorn
+            from prometheus_client import CollectorRegistry
+            from prometheus_client.multiprocess import MultiProcessCollector
+
+            registry = CollectorRegistry()
+            MultiProcessCollector(registry)  # This has a side effect.
+        else:
+            from prometheus_client import REGISTRY as registry
+
+        return registry
+
+    @router.get("/metrics")
+    async def metrics(request: Request, _=Security(check_scopes, scopes=["metrics"])):
+        """
+        Prometheus metrics
+        """
+
+        request.state.endpoint = "metrics"
+        data = generate_latest(prometheus_registry())
+        return Response(data, headers={"Content-Type": CONTENT_TYPE_LATEST})
 
     return router

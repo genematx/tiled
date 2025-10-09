@@ -250,7 +250,7 @@ class SAMLAuthenticator(ExternalAuthenticator):
     def __init__(
         self,
         saml_settings,  # See EXAMPLE_SAML_SETTINGS below.
-        attribute_name: str,  # which SAML attribute to use as 'id' for Idenity
+        attribute_name: str,  # which SAML attribute to use as 'id' for Identity
         confirmation_message: str = "",
     ):
         self.saml_settings = saml_settings
@@ -274,13 +274,6 @@ class SAMLAuthenticator(ExternalAuthenticator):
         async def saml_login(request: Request) -> RedirectResponse:
             req = await prepare_saml_from_fastapi_request(request)
             auth = OneLogin_Saml2_Auth(req, self.saml_settings)
-            # saml_settings = auth.get_settings()
-            # metadata = saml_settings.get_sp_metadata()
-            # errors = saml_settings.validate_metadata(metadata)
-            # if len(errors) == 0:
-            #   print(metadata)
-            # else:
-            #   print("Error found on Metadata: %s" % (', '.join(errors)))
             callback_url = auth.login()
             return RedirectResponse(url=callback_url)
 
@@ -679,7 +672,7 @@ class LDAPAuthenticator(InternalAuthenticator):
     def get_connection(self, userdn, password):
         import ldap3
 
-        # NOTE: setting 'acitve=False' essentially disables exclusion of inactive servers from the pool.
+        # NOTE: setting 'active=False' essentially disables exclusion of inactive servers from the pool.
         # It probably does not matter if the pool contains only one server, but it could have implications
         # when there are multiple servers in the pool. It is not clear what those implications are.
         # But using the default 'activate=True' results in the thread being blocked indefinitely

@@ -7,8 +7,9 @@ import dask.dataframe
 import pandas
 
 from ..catalog.orm import Node
+from ..storage import FileStorage, Storage
 from ..structures.core import Spec, StructureFamily
-from ..structures.data_source import Asset, DataSource, Storage
+from ..structures.data_source import Asset, DataSource
 from ..structures.table import TableStructure
 from ..type_aliases import JSON
 from ..utils import path_from_uri
@@ -21,6 +22,7 @@ class ParquetDatasetAdapter:
     """ """
 
     structure_family = StructureFamily.table
+    supported_storage = {FileStorage}
 
     def __init__(
         self,
@@ -91,7 +93,7 @@ class ParquetDatasetAdapter:
 
         """
         data_source = copy.deepcopy(data_source)  # Do not mutate caller input.
-        data_uri = storage.get("filesystem") + "".join(
+        data_uri = storage.uri + "".join(
             f"/{quote_plus(segment)}" for segment in path_parts
         )
         directory = path_from_uri(data_uri)
@@ -109,17 +111,16 @@ class ParquetDatasetAdapter:
         return data_source
 
     def write_partition(
-        self, data: Union[dask.dataframe.DataFrame, pandas.DataFrame], partition: int
+        self, partition: int, data: Union[dask.dataframe.DataFrame, pandas.DataFrame]
     ) -> None:
-        """
+        """Write data to a specific partition
 
         Parameters
         ----------
-        data :
-        partition :
-
-        Returns
-        -------
+        partition : int
+            index of the partition to be written to
+        data : dask.dataframe.DataFrame or pandas.DataFrame
+            data to be written
 
         """
         uri = self._partition_paths[partition]
@@ -170,12 +171,6 @@ class ParquetDatasetAdapter:
         return self.dataframe_adapter.read_partition(*args, **kwargs)
 
     def structure(self) -> TableStructure:
-        """
-
-        Returns
-        -------
-
-        """
         return self._structure
 
     def get(self, key: str) -> Union[ArrayAdapter, None]:

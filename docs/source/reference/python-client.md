@@ -55,6 +55,16 @@ and several convenience methods:
    tiled.iterviews.ValuesView.tail
 ```
 
+as well as a method for controlling the "page size" in which results will be
+batched across requests, which affects performance.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+
+   tiled.iterviews.ValuesView.page_size
+```
+
 Likewise for `.keys()` and `.items()`.
 
 Beyond the Mapping interface, Container adds the following attributes
@@ -99,7 +109,7 @@ And, finally, there are convenience methods for writing:
    tiled.client.container.Container.create_container
    tiled.client.container.Container.write_array
    tiled.client.container.Container.write_awkward
-   tiled.client.container.Container.write_dataframe
+   tiled.client.container.Container.write_table
    tiled.client.container.Container.write_sparse
 ```
 

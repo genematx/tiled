@@ -35,9 +35,9 @@ def test_include_data_sources_method_on_self(client):
     "Calling include_data_sources() fetches data sources on self."
     x = client.write_array([1, 2, 3], key="x")
     # Fetch data_sources on x object directly.
-    x.data_sources() is not None
+    assert x.data_sources() is not None
     # Fetch data_sources on x object, looked up in client.
-    client["x"].data_sources() is not None
+    assert client["x"].data_sources() is not None
     assert client["x"].include_data_sources().data_sources() is not None
 
 
@@ -75,7 +75,7 @@ def test_raw_export(client, tmpdir):
 def test_asset_range_request(client, tmpdir):
     "Access part of an asset using an HTTP Range header."
     df = pandas.DataFrame({"A": [1, 2, 3], "B": [4.0, 5.0, 6.0]})
-    client.write_dataframe(df, key="x")
+    client.write_table(df, key="x")
     # Fetch the first byte.
     first_byte_response = client.context.http_client.get(
         "/api/v1/asset/bytes/x?id=1",
