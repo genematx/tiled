@@ -49,11 +49,9 @@ class CSVAdapter(Adapter[TableStructure]):
         self._file_paths = [path_from_uri(uri) for uri in data_uris]
         self._read_csv_kwargs = kwargs
         if structure is None:
-            table = dask.dataframe.read_csv(
-                self._file_paths[0], **self._read_csv_kwargs
-            )
-            structure = TableStructure.from_dask_dataframe(table)
-            structure.npartitions = len(self._file_paths)
+            ddf = dask.dataframe.read_csv(self._file_paths, **self._read_csv_kwargs)
+            structure = TableStructure.from_dask_dataframe(ddf)
+            structure.npartitions = ddf.npartitions
         super().__init__(structure, metadata=metadata, specs=specs)
 
     @classmethod
@@ -325,7 +323,11 @@ class CSVArrayAdapter(ArrayAdapter):
             # NOTE: dask.DataFrame.to_records() allows one to pass `index=False` to drop the index column, but as
             #       of desk ver. 2024.2.1 it seems broken and doesn't do anything. Instead, we set an index to any
             #       (first) column in the df to prevent it from creating an extra one.
-            array = ddf.set_index(ddf.columns[0]).to_records(lengths=chunks_0).reshape(-1, 1)
+            array = (
+                ddf.set_index(ddf.columns[0])
+                .to_records(lengths=chunks_0)
+                .reshape(-1, 1)
+            )
         else:
             # Simple np dtype (1 or 2) -- all fields have the same type -- return a usual array
             array = ddf.to_dask_array(lengths=chunks_0)
