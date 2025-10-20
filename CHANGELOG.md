@@ -17,10 +17,16 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 - `locking` key-word argument in HDFAdapter and HDF5Adapter.
 
+### Added
+
+- `locking` key-word argument in HDFAdapter and HDF5Adapter.
+
 ### Fixed
 
 - Column names in `TableStructure` are explicitly converted to strings.
 - Ensure that structural dtype arrays read with `CSVAdapter` have two dimensions, `(n, 1)`.
+- Allow extra kwargs to be passed to `HDF5ArrayAdapter` when intialized via `HDF5Adapter.from_uris`
+  with an explicit `dataset` parameter.
 
 
 ## v0.1.6 (2025-09-29)

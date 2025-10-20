@@ -312,11 +312,14 @@ class CSVArrayAdapter(ArrayAdapter):
         nrows = kwargs.pop("nrows", None)  # dask doesn't accept nrows
         kwargs = {"header": None, **kwargs}  # no header for arrays by default
         ddf = dask.dataframe.read_csv(file_paths, **kwargs).rename(columns=str)
+<<<<<<< HEAD
 
         # Ensure columns are in the same order as in the usecols parameter
         if usecols := kwargs.get("usecols"):
             ddf = ddf[usecols]
 
+=======
+>>>>>>> hdf5-kwargs
         chunks_0: tuple[int, ...] = structure.chunks[0]  # rows chunking, if not stacked
 
         # Read as a structural array if needed; ensure the correct dtype
