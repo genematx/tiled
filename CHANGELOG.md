@@ -16,6 +16,30 @@ Write the date in place of the "Unreleased" in the case a new version is release
 ### Added
 
 - `locking` key-word argument in HDFAdapter and HDF5Adapter.
+## Unreleased
+
+### Added
+
+- Optional `persist` query parameter to PUT and PATCH /array/... routes, and
+  the corresponding DaskArrayClient methods: `write`, `write_block`, `patch`.
+- Added new delete:node and delete:revision scopes
+
+### Changed
+
+- The public demo hosted by NSLS2 has moved from `tiled-demo.blueskyproject.io`
+  to `tiled-demo.nsls2.bnl.gov`, for purely practical reasons. (It is easier to
+  manage the deployment and associated certificates.) **The demo remains
+  world-public, with no login required.** This change affects some
+  documentation and one test.
+- Deletion of nodes or metadata revisions now requires deletion scopes,
+  rather than writing scopes.
+
+## Fixed
+
+- Fixed a couple of bugs in the example config, to restore it to working order
+
+
+## v0.2.0 (2025-10-29)
 
 ### Added
 
