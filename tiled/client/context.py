@@ -12,7 +12,8 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractAsyncContextManager as ContextManager
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, List, Literal
+from typing import Any, List, Literal, TypeVar
+
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -37,6 +38,7 @@ USER_AGENT = f"python-tiled/{tiled_version}"
 API_KEY_AUTH_HEADER_PATTERN = re.compile(r"^Apikey (\w+)$")
 
 DEFAULT_POOL_SIZE = 100
+T = TypeVar("T")
 
 
 def raise_if_cannot_prompt():
@@ -177,7 +179,7 @@ def requestor(generator: bool = False, asynchronous: bool | None = None) -> Call
 
     """
 
-    def decorator[T](func: T) -> T:
+    def decorator(func: T) -> T:
         @functools.wraps(func)
         def inner(*args, **kwargs):
             # match (asynchronous, generator, hasattr(args[0], "context")):
@@ -1207,7 +1209,7 @@ and enter the code:
     return tokens
 
 
-def send_requests[T](requestor: Generator[TiledRequest, httpx.Response, T]) -> T:
+def send_requests(requestor: Generator[TiledRequest, httpx.Response, T]) -> T:
     """Perform an HTTP request using *http_client* on behalf of *requestor*."""
     # Prime the generator
     response = None
@@ -1235,9 +1237,7 @@ def send_requests[T](requestor: Generator[TiledRequest, httpx.Response, T]) -> T
             requestor.throw(exc)
 
 
-def send_requests_generator[
-    T
-](
+def send_requests_generator(
     requestor: Generator[tuple[httpx.Client | None, httpx.Request], httpx.Response, T]
 ) -> Generator[T, Any, None]:
     """Perform an HTTP request using *http_client* on behalf of *requestor*."""
@@ -1269,9 +1269,7 @@ def send_requests_generator[
             requestor.throw(exc)
 
 
-async def send_requests_async[
-    T
-](
+async def send_requests_async(
     requestor: Generator[
         # Yield type is wrong, need to come back and fix
         TiledRequest | Sequence[Generator],
@@ -1310,9 +1308,7 @@ async def send_requests_async[
             requestor.throw(exc)
 
 
-async def send_requests_generator_async[
-    T
-](
+async def send_requests_generator_async(
     requestor: Generator[
         tuple[httpx.AsyncClient | None, httpx.Request], httpx.Response, T
     ]
