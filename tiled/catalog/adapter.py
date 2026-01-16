@@ -68,7 +68,11 @@ from ..mimetypes import (
     ZARR_MIMETYPE,
 )
 from ..query_registration import QueryTranslationRegistry
-from ..server.connection_pool import close_database_connection_pool, get_database_engine
+from ..server.connection_pool import (
+    close_database_connection_pool,
+    get_database_engine,
+    is_memory_sqlite,
+)
 from ..server.core import NoEntry
 from ..server.schemas import Asset, DataSource, Management, Revision
 from ..server.settings import DatabaseSettings
@@ -229,10 +233,7 @@ class Context:
             return result
 
     async def startup(self):
-        if (self.engine.dialect.name == "sqlite") and (
-            self.engine.url.database == ":memory:"
-            or self.engine.url.query.get("mode") == "memory"
-        ):
+        if is_memory_sqlite(self.engine.url):
             # Special-case for in-memory SQLite: Because it is transient we can
             # skip over anything related to migrations.
             await initialize_database(self.engine)
@@ -534,7 +535,7 @@ class CatalogNodeAdapter:
             ),
         )
         for query in self.queries:
-            if hasattr(adapter, "searc"):
+            if hasattr(adapter, "search"):
                 adapter = adapter.search(query)
         return adapter
 
@@ -1719,19 +1720,21 @@ def from_uri(
         # The cleanest option available is to start a subprocess
         # because SQLite is allergic to threads.
         import subprocess
+        from subprocess import CalledProcessError
 
         # TODO Check if catalog exists.
-        process = subprocess.run(
-            [sys.executable, "-m", "tiled", "catalog", "init", "--if-not-exists", uri],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-        # Capture stdout and stderr from the subprocess and write to logging
-        stdout = process.stdout.decode()
-        stderr = process.stderr.decode()
-        logger.info(f"Subprocess stdout: {stdout}")
-        logger.info(f"Subprocess stderr: {stderr}")
+        cmd = [sys.executable, "-m", "tiled", "catalog", "init", "--if-not-exists", uri]
+        try:
+            process = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+            )
+            # Capture stdout and stderr from the subprocess and write to logging
+            logger.info(f"Subprocess stdout: {process.stdout.decode()}")
+            logger.info(f"Subprocess stderr: {process.stderr.decode()}")
+
+        except CalledProcessError as cpe:
+            cpe.__cause__ = DatabaseInitializationError(cpe.stderr.decode())
+            raise
 
     database_settings = DatabaseSettings(
         uri=uri,
@@ -1861,3 +1864,7 @@ STRUCTURES = {
     StructureFamily.sparse: CatalogSparseAdapter,
     StructureFamily.table: CatalogTableAdapter,
 }
+
+
+class DatabaseInitializationError(Exception):
+    pass
