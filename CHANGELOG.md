@@ -3,13 +3,35 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 # Changelog
 
+## v0.2.0 (unreleased)
+
+### Added
+
+- Tests to ensure that CSVAdapter can be used with a subset of columns.
+
+### Changed
+
+- Enable Tiled server to accept bearer access tokens for authentication
+
+### Added
+
+- `locking` key-word argument in HDFAdapter and HDF5Adapter.
 ## Unreleased
+
+### Added
+
+- Support for including custom FastAPI routers via a new `routers` configuration
+  field at the server level.
 
 ### Changed
 
 - Arrays accessed by `ArrayAdapter`, its subclasses, and related adapters (e.g. `HDF5ArrayAdapter`,
   `FileSequenceAdapter`) are reshaped by default to match the shape declared in the
   associated structure, where possible.
+
+### Fixed
+
+- Slow performance when deleting nodes in large catalogs with many nodes.
 
 ## v0.2.3 (2025-12-17)
 
@@ -123,6 +145,10 @@ Write the date in place of the "Unreleased" in the case a new version is release
 - Prevent exception when serving asset from a node if stat_result already found
 - Column names in `TableStructure` are explicitly converted to strings.
 - Ensure that structural dtype arrays read with `CSVAdapter` have two dimensions, `(n, 1)`.
+<<<<<<< HEAD
+- Allow extra kwargs to be passed to `HDF5ArrayAdapter` when intialized via `HDF5Adapter.from_uris`
+  with an explicit `dataset` parameter.
+=======
 - Updated minimum version of starlette, which implements new (standard) names
   for HTTP status codes
 - Allow extra kwargs to be passed to `HDF5ArrayAdapter` when intialized via `HDF5Adapter`
@@ -133,6 +159,7 @@ Write the date in place of the "Unreleased" in the case a new version is release
 ### Refactored
 
 - Use common base type for all access policy types
+>>>>>>> main
 
 
 ## v0.1.6 (2025-09-29)
