@@ -3,13 +3,38 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 # Changelog
 
+## v0.2.0 (unreleased)
+
+### Added
+
+- Tests to ensure that CSVAdapter can be used with a subset of columns.
+
+### Changed
+
+- Enable Tiled server to accept bearer access tokens for authentication
+
+### Added
+
+- `locking` key-word argument in HDFAdapter and HDF5Adapter.
 ## Unreleased
+
+### Added
+
+- Support for including custom FastAPI routers via a new `routers` configuration
+  field at the server level.
 
 ### Changed
 
 - Arrays accessed by `ArrayAdapter`, its subclasses, and related adapters (e.g. `HDF5ArrayAdapter`,
   `FileSequenceAdapter`) are reshaped by default to match the shape declared in the
   associated structure, where possible.
+- Removed support for Python 3.9, which reached its end of life in October 2025.
+- When creating an access-tag restricted API key, the `inherit` scope is no longer valid to request. Instead, the specific scopes desired for the key should be requested.
+
+### Fixed
+
+- Slow performance when deleting nodes in large catalogs with many nodes.
+- Error handling in `tiled.client.download._download_url`.
 
 ## v0.2.3 (2025-12-17)
 
