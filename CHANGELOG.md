@@ -9,6 +9,9 @@ Write the date in place of the "Unreleased" in the case a new version is release
 ### Added
 
 - Support for slicing arrays backed by multipart adapters with modified shapes
+### Fixed
+
+- Writing chunked (dask) arrays with single chunk along all dimensions
 
 ### Changed
 
