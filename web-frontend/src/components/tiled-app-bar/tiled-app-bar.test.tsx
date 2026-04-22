@@ -1,42 +1,13 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { TiledAppBar } from "./tiled-app-bar";
-import { AuthProvider } from "../../auth/auth-provider";
-
-import * as AuthContext from "../../auth/auth-context";
+import TiledAppBar from "./tiled-app-bar";
 
 describe("TiledAppBar", () => {
-  const renderAppBar = (currentRoute = "/", isAuthenticated = false) => {
-    vi.spyOn(AuthContext, "useAuth").mockReturnValue({
-      isAuthenticated,
-      user: isAuthenticated
-        ? { id: "testuser", uuid: "test-uuid", type: "test-type" }
-        : null,
-      login: vi.fn(),
-      logout: vi.fn(),
-      isLoading: false,
-      refreshTokens: vi.fn(),
-      tokens: null,
-      error: null,
-      authConfig: {
-        required: false,
-        providers: [],
-        links: {
-          whoami: "",
-          apikey: "",
-          refresh_session: "",
-          revoke_session: "",
-          logout: "",
-        },
-      },
-    });
-
+  const renderAppBar = (currentRoute = "/") => {
     return render(
       <MemoryRouter initialEntries={[currentRoute]}>
-        <AuthProvider>
-          <TiledAppBar />
-        </AuthProvider>
+        <TiledAppBar />
       </MemoryRouter>,
     );
   };
@@ -46,10 +17,11 @@ describe("TiledAppBar", () => {
     expect(screen.getByText("TILED")).toBeInTheDocument();
   });
 
-  it("has a working Browse button that links to the browse page", () => {
-    renderAppBar("/login", true);
-    const browseButton = screen.getByRole("button", { name: "Browse" });
-    expect(browseButton).toBeInTheDocument();
+  it("has a clickable TILED logo that links to the browse page", () => {
+    renderAppBar();
+    const homeLink = screen.getByRole("link", { name: /TILED/i });
+    expect(homeLink).toBeInTheDocument();
+    expect(homeLink).toHaveAttribute("href", "/browse/");
   });
 
   it("looks like a proper navigation bar", () => {

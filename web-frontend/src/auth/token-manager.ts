@@ -1,49 +1,101 @@
-import { AuthTokens } from "./types";
+import { AuthTokens, UserIdentity } from "./types";
 
-const TOKEN_KEY = "tiled_tokens";
+const ACCESS_TOKEN_KEY = "tiled_access_token";
+const REFRESH_TOKEN_KEY = "tiled_refresh_token";
+const IDENTITY_KEY = "tiled_identity";
 const TOKEN_EXPIRY_BUFFER_MS = 60 * 1000; // 60 seconds
+
+// Expose token globally so external spec_view scripts can use it.
+declare global {
+  interface Window {
+    __TILED_ACCESS_TOKEN__?: string | null;
+  }
+}
 
 interface JWTPayload {
   exp?: number;
-  iat?: number;
-  sub?: string;
   [key: string]: unknown;
 }
 
+function decodeJWT(token: string): JWTPayload | null {
+  try {
+    const [, payload] = token.split(".");
+    if (!payload) return null;
+    // Handle base64url encoding
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
+}
+
 class TokenManager {
-  saveTokens(tokens: AuthTokens): void {
-    sessionStorage.setItem(TOKEN_KEY, JSON.stringify(tokens));
-  }
-
-  getTokens(): AuthTokens | null {
-    const tokensJson = sessionStorage.getItem(TOKEN_KEY);
-    return tokensJson ? JSON.parse(tokensJson) : null;
-  }
-
-  clearTokens(): void {
-    sessionStorage.removeItem(TOKEN_KEY);
-  }
-
-  isAccessTokenExpired(tokens: AuthTokens): boolean {
-    const payload = this.decodeToken(tokens.access_token);
-    if (!payload?.exp) return true;
-
-    const expirationTime = payload.exp * 1000;
-    const timeUntilExpiry = expirationTime - Date.now();
-
-    return timeUntilExpiry < TOKEN_EXPIRY_BUFFER_MS;
-  }
-
-  private decodeToken(token: string): JWTPayload | null {
+  constructor() {
+    // Initialize global on module load
     try {
-      const [, payload] = token.split(".");
-      if (!payload) return null;
+      window.__TILED_ACCESS_TOKEN__ = localStorage.getItem(ACCESS_TOKEN_KEY);
+    } catch {
+      // localStorage not available (e.g., in tests)
+    }
+  }
 
-      const decoded = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
-      return JSON.parse(decoded);
+  saveTokens(tokens: AuthTokens, identity?: UserIdentity): void {
+    localStorage.setItem(ACCESS_TOKEN_KEY, tokens.access_token);
+    localStorage.setItem(REFRESH_TOKEN_KEY, tokens.refresh_token);
+    window.__TILED_ACCESS_TOKEN__ = tokens.access_token;
+    if (identity) {
+      localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity));
+    }
+  }
+
+  getAccessToken(): string | null {
+    return localStorage.getItem(ACCESS_TOKEN_KEY);
+  }
+
+  getRefreshToken(): string | null {
+    return localStorage.getItem(REFRESH_TOKEN_KEY);
+  }
+
+  getIdentity(): UserIdentity | null {
+    try {
+      return JSON.parse(localStorage.getItem(IDENTITY_KEY) || "null");
     } catch {
       return null;
     }
+  }
+
+  clearTokens(): void {
+    localStorage.removeItem(ACCESS_TOKEN_KEY);
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
+    localStorage.removeItem(IDENTITY_KEY);
+    window.__TILED_ACCESS_TOKEN__ = null;
+  }
+
+  hasTokens(): boolean {
+    return !!this.getAccessToken();
+  }
+
+  /**
+   * Check if the access token is expired or about to expire.
+   */
+  isAccessTokenExpired(): boolean {
+    const token = this.getAccessToken();
+    if (!token) return true;
+    const payload = decodeJWT(token);
+    if (!payload?.exp) return true;
+    return payload.exp * 1000 - Date.now() < TOKEN_EXPIRY_BUFFER_MS;
+  }
+
+  /**
+   * Returns milliseconds until the access token expires, or 0 if already expired.
+   */
+  getTimeUntilExpiry(): number {
+    const token = this.getAccessToken();
+    if (!token) return 0;
+    const payload = decodeJWT(token);
+    if (!payload?.exp) return 0;
+    return Math.max(0, payload.exp * 1000 - Date.now());
   }
 }
 

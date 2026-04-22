@@ -1,25 +1,40 @@
 import { createContext, useContext } from "react";
-import { AuthState, AuthConfig } from "./types";
+import { UserIdentity } from "./types";
+import { components } from "../openapi_schemas";
 
-interface AuthContextType extends AuthState {
-  login: (
-    provider: string,
-    username: string,
-    password: string,
-  ) => Promise<void>;
-  logout: () => Promise<void>;
-  refreshTokens: () => Promise<void>;
-  authConfig: AuthConfig | null;
+export interface AuthContextType {
+  /** Whether the server requires authentication. */
+  authRequired: boolean;
+  /** Authentication providers from the server's /api/v1/ response. */
+  providers: components["schemas"]["AboutAuthenticationProvider"][];
+  /** Whether the user is currently authenticated (has valid tokens). */
+  isAuthenticated: boolean;
+  /** Whether auth initialization is complete. */
+  initialized: boolean;
+  /** The authenticated user's identity (id + provider). */
+  identity: UserIdentity | null;
+  /** Called after successful login to store tokens and update state. */
+  onLogin: (
+    accessToken: string,
+    refreshToken: string,
+    identity?: UserIdentity,
+  ) => void;
+  /** Log out: revokes session server-side and clears local state. */
+  onLogout: () => void;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+const AuthContext = createContext<AuthContextType>({
+  authRequired: false,
+  providers: [],
+  isAuthenticated: false,
+  initialized: false,
+  identity: null,
+  onLogin: () => {},
+  onLogout: () => {},
+});
 
 export function useAuth() {
-  const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error("useAuth must be used within AuthProvider");
-  }
-  return context;
+  return useContext(AuthContext);
 }
 
 export { AuthContext };

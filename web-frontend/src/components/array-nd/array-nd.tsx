@@ -4,15 +4,12 @@ import Alert from "@mui/material/Alert";
 import Box from "@mui/material/Box";
 import CutSlider from "../cut-slider/cut-slider";
 import Typography from "@mui/material/Typography";
-import CircularProgress from "@mui/material/CircularProgress";
 import { components } from "../../openapi_schemas";
 import { debounce } from "ts-debounce";
 import useMediaQuery from "@mui/material/useMediaQuery";
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useTheme } from "@mui/material/styles";
 import { axiosInstance } from "../../client";
-import { tokenManager } from "../../auth/token-manager";
-import { useAuth } from "../../auth/auth-context";
 
 interface IProps {
   segments: string[];
@@ -101,77 +98,41 @@ interface ImageDisplayProps {
 }
 
 const ImageDisplay: React.FunctionComponent<ImageDisplayProps> = (props) => {
-  const [imageSrc, setImageSrc] = useState<string>("");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string>("");
-  const {tokens} = useAuth();
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const sliceParts = props.cuts.map((c) => c.toString());
+  if (props.stride !== 1) {
+    sliceParts.push(`::${props.stride}`, `::${props.stride}`);
+  }
+  const url =
+    sliceParts.length > 0
+      ? `${props.link}?format=image/png&slice=${sliceParts.join(",")}`
+      : `${props.link}?format=image/png`;
 
   useEffect(() => {
-    let cancelled = false;
     let objectUrl: string | null = null;
-
-    const fetchImage = async () => {
-      try {
-        setLoading(true);
-        setError("");
-
-        let url = `${props.link}?format=image/png&slice=${props.cuts.join(",")}`;
-        if (props.stride !== 1) {
-          url += `,::${props.stride},::${props.stride}`;
-        }
-
-        const token = tokens?.access_token;
-        if (!token) {
-          throw new Error("No authentication token available");
-        }
-
-        const response = await axiosInstance.get(url, {
-          responseType: "blob",
-        });
-
-        if (!cancelled) {
-          objectUrl = URL.createObjectURL(response.data);
-          setImageSrc(objectUrl);
-          setLoading(false);
-        }
-      } catch (err: any) {
-        if (!cancelled) {
-          setError(err.response?.data?.message || err.message || "Failed to load image");
-          setLoading(false);
-        }
-      }
-    };
-
-    fetchImage();
-
+    const controller = new AbortController();
+    axiosInstance
+      .get(url, { responseType: "blob", signal: controller.signal })
+      .then((resp) => {
+        objectUrl = URL.createObjectURL(resp.data);
+        setBlobUrl(objectUrl);
+      })
+      .catch(() => {});
     return () => {
-      cancelled = true;
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [props.link, props.cuts.join(","), props.stride, tokens?.access_token]);
+  }, [url]);
 
-  if (loading) {
-    return (
-      <Box sx={{ display: "flex", justifyContent: "center", p: 3 }}>
-        <CircularProgress />
-      </Box>
-    );
-  }
-
-  if (error) {
-    return <Alert severity="error">{error}</Alert>;
-  }
-
+  if (!blobUrl) return null;
   return (
     <Box
       component="img"
       sx={{ maxWidth: 1 }}
       alt="Data rendered"
-      src={imageSrc}
-      loading="lazy"
+      src={blobUrl}
     />
   );
 };
+
 export default ArrayND;

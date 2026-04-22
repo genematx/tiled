@@ -1,19 +1,26 @@
 import Container from "@mui/material/Container";
 import ErrorBoundary from "./components/error-boundary/error-boundary";
-import { Outlet } from "react-router-dom";
-import { TiledAppBar } from "./components/tiled-app-bar/tiled-app-bar";
-import { useEffect, useState } from "react";
-import { fetchSettings, getApiBaseUrl } from "./settings";
+import { Outlet, Navigate, BrowserRouter, Route, Routes } from "react-router-dom";
+import TiledAppBar from "./components/tiled-app-bar/tiled-app-bar";
+import React, { useEffect, useState } from "react";
+import * as ReactDOM from "react-dom";
+import { fetchSettings } from "./settings";
 import { SettingsContext, emptySettings } from "./context/settings";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { AuthProvider } from "./auth/auth-provider";
+import { useAuth } from "./auth/auth-context";
+import { about } from "./client";
+import { components } from "./openapi_schemas";
 import { Suspense, lazy } from "react";
 import Skeleton from "@mui/material/Skeleton";
-import { LoginPage } from "./components/login-page/login-page";
-import { ProtectedRoute } from "./components/protected-route";
-import { Navigate } from "react-router-dom";
-import { AuthProvider } from "./auth/auth-provider";
+
+// Expose React globals so external spec_view plugins (IIFE bundles)
+// can use React without bundling their own copy.
+(window as any).React = React;
+(window as any).ReactDOM = ReactDOM;
 
 const Browse = lazy(() => import("./routes/browse"));
+const LoginPage = lazy(() => import("./routes/login"));
+const AuthCallback = lazy(() => import("./routes/auth-callback"));
 
 function MainContainer() {
   return (
@@ -26,39 +33,65 @@ function MainContainer() {
   );
 }
 
+function RequireAuth({ children }: { children: React.ReactElement }) {
+  const { authRequired, isAuthenticated, initialized } = useAuth();
+  if (!initialized) return <Skeleton variant="rectangular" />;
+  if (authRequired && !isAuthenticated) return <Navigate to="/login" replace />;
+  return children;
+}
+
 // This is set in vite.config.js. It is the base path of the ui.
 const basename = import.meta.env.BASE_URL;
 
 function App() {
-  const [settings, setSettings] = useState({
-    ...emptySettings,
-    api_url: `${getApiBaseUrl()}/api/v1`,
-  });
+  const [settings, setSettings] = useState(emptySettings);
+  const [authentication, setAuthentication] =
+    useState<components["schemas"]["AboutAuthentication"] | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
-    fetchSettings(controller.signal).then(setSettings);
+    async function init() {
+      try {
+        const [settingsData, aboutData] = await Promise.all([
+          fetchSettings(controller.signal),
+          about(),
+        ]);
+        setSettings(settingsData);
+        setAuthentication(aboutData.authentication);
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          console.error("Failed to initialize app:", err);
+          setAuthentication({ required: false, providers: [] });
+        }
+      }
+    }
+    init();
     return () => controller.abort();
   }, []);
+
   return (
-    <BrowserRouter basename={basename}>
-      <ErrorBoundary>
-        <AuthProvider>
-          <SettingsContext.Provider value={settings}>
+    <SettingsContext.Provider value={settings}>
+      <AuthProvider authentication={authentication}>
+        <BrowserRouter basename={basename}>
+          <ErrorBoundary>
             <Suspense fallback={<Skeleton variant="rectangular" />}>
               <Routes>
-                <Route path="/login" element={<LoginPage />} />
-                <Route
-                  path="/"
-                  element={
-                    <ProtectedRoute>
-                      <MainContainer />
-                    </ProtectedRoute>
-                  }
-                >
-                  <Route index element={<Navigate to="/browse" replace />} />
-                  <Route path="browse/*" element={<Browse />} />
+                <Route path="/" element={<MainContainer />}>
+                  <Route
+                    index
+                    element={<Navigate to="/browse/" replace />}
+                  />
+                  <Route
+                    path="/browse/*"
+                    element={
+                      <RequireAuth>
+                        <Browse />
+                      </RequireAuth>
+                    }
+                  />
                 </Route>
+                <Route path="/login" element={<LoginPage />} />
+                <Route path="/auth/callback" element={<AuthCallback />} />
                 <Route
                   path="*"
                   element={
@@ -69,10 +102,10 @@ function App() {
                 />
               </Routes>
             </Suspense>
-          </SettingsContext.Provider>
-        </AuthProvider>
-      </ErrorBoundary>
-    </BrowserRouter>
+          </ErrorBoundary>
+        </BrowserRouter>
+      </AuthProvider>
+    </SettingsContext.Provider>
   );
 }
 

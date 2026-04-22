@@ -1,11 +1,10 @@
 import axios from "axios";
+import { components } from "./openapi_schemas";
 
-const axiosInstance = axios.create({
-  headers: {
-    "Content-Type": "application/json",
-  },
-});
+const axiosInstance = axios.create();
 
+// Transform absolute URLs in "links" fields to relative paths so the UI
+// works regardless of the origin the server reports.
 function toRelativePath(urlString: string): string {
   try {
     const url = new URL(urlString);
@@ -39,7 +38,7 @@ function transformLinks(data: any): any {
 
 axiosInstance.interceptors.response.use(
   (response) => {
-    if (response.config.responseType === "blob"){
+    if (response.config.responseType === "blob") {
       return response;
     }
     response.data = transformLinks(response.data);
@@ -47,65 +46,6 @@ axiosInstance.interceptors.response.use(
   },
   (error) => Promise.reject(error),
 );
-
-export function setupAuthInterceptor(getAccessToken: () => string | null) {
-  axiosInstance.interceptors.request.use(
-    (config) => {
-      const token = getAccessToken();
-      if (token) {
-        config.headers = config.headers || {};
-        config.headers.Authorization = `Bearer ${token}`;
-      }
-      return config;
-    },
-    (error) => Promise.reject(error),
-  );
-}
-
-export function setupRefreshInterceptor(
-  getRefreshToken: () => string | null,
-  refreshTokenFn: (refreshToken: string) => Promise<any>,
-  saveTokens: (tokens: any) => void,
-  clearTokens: () => void,
-) {
-  axiosInstance.interceptors.response.use(
-    (response) => response,
-    async (error) => {
-      const originalRequest = error.config;
-
-      if (error.response?.status === 401 && !originalRequest._retry) {
-        originalRequest._retry = true;
-
-        try {
-          const refreshToken = getRefreshToken();
-
-          if (!refreshToken) {
-            throw new Error("No refresh token available");
-          }
-
-          const newTokens = await refreshTokenFn(refreshToken);
-          saveTokens(newTokens);
-
-          originalRequest.headers = originalRequest.headers || {};
-          originalRequest.headers.Authorization = `Bearer ${newTokens.access_token}`;
-          return axiosInstance(originalRequest);
-        } catch (refreshError) {
-          console.error(refreshError);
-          clearTokens();
-
-          // Redirect to login
-          if (typeof window !== "undefined") {
-            window.location.href = "/ui/login";
-          }
-
-          return Promise.reject(refreshError);
-        }
-      }
-
-      return Promise.reject(error);
-    },
-  );
-}
 
 export const search = async (
   apiURL: string,
@@ -115,13 +55,17 @@ export const search = async (
   selectMetadata: string | null = null,
   pageOffset: number = 0,
   pageLimit: number = 100,
-): Promise<any> => {
-  const fieldsParam =
-    fields.length > 0 ? `&fields=${fields.join("&fields=")}` : "";
-  let url = `${apiURL}/search/${segments.join("/")}?page[offset]=${pageOffset}&page[limit]=${pageLimit}${fieldsParam}`;
-
+  sort: string | null = null,
+): Promise<
+  components["schemas"]["Response_List_tiled.server.router.Resource_NodeAttributes__dict__dict____PaginationLinks__dict_"]
+> => {
+  let url = `${apiURL}/search/${segments.join(
+    "/",
+  )}?page[offset]=${pageOffset}&page[limit]=${pageLimit}&fields=${fields.join(
+    "&fields=",
+  )}`;
   if (selectMetadata !== null) {
-    url += `&select_metadata=${selectMetadata}`;
+    url = url.concat(`&select_metadata=${selectMetadata}`);
   }
   if (sort) {
     url = url.concat(`&sort=${encodeURIComponent(sort)}`);
@@ -135,17 +79,20 @@ export const metadata = async (
   segments: string[],
   signal: AbortSignal,
   fields: string[] = [],
-): Promise<any> => {
-  const fieldsParam =
-    fields.length > 0 ? `?fields=${fields.join("&fields=")}` : "";
-  const url = `${apiURL}/metadata/${segments.join("/")}${fieldsParam}`;
-
-  const response = await axiosInstance.get(url, { signal });
+): Promise<
+  components["schemas"]["Response_Resource_NodeAttributes__dict__dict___dict__dict_"]
+> => {
+  const response = await axiosInstance.get(
+    `${apiURL}/metadata/${segments.join("/")}?fields=${fields.join(
+      "&fields=",
+    )}`,
+    { signal: signal },
+  );
   return response.data;
 };
 
-export const about = async (apiURL: string = "/api/v1"): Promise<any> => {
-  const response = await axiosInstance.get(`${apiURL}/`);
+export const about = async (): Promise<components["schemas"]["About"]> => {
+  const response = await axiosInstance.get("/api/v1/");
   return response.data;
 };
 

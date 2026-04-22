@@ -1,247 +1,183 @@
-import React, { useEffect, useState, useCallback, useRef } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
+import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
 import { AuthContext } from "./auth-context";
-import { authService } from "./auth-api";
 import { tokenManager } from "./token-manager";
-import { AuthState, AuthConfig, AuthTokens } from "./types";
-import { setupAuthInterceptor, setupRefreshInterceptor } from "../client";
+import { UserIdentity } from "./types";
+import { axiosInstance } from "../client";
+import { components } from "../openapi_schemas";
 
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
+interface AuthProviderProps {
+  /** Authentication config from the server's GET /api/v1/ response. Null while loading. */
+  authentication: components["schemas"]["AboutAuthentication"] | null;
+  children: React.ReactNode;
+}
+
+/**
+ * Provides authentication state and token lifecycle management.
+ *
+ * - Sets up axios interceptors (request: attach Bearer token, response: 401 → refresh)
+ * - Schedules proactive token refresh before expiry
+ * - Cleans up interceptors on unmount
+ */
+export const AuthProvider: React.FC<AuthProviderProps> = ({
+  authentication,
   children,
 }) => {
-  const [state, setState] = useState<AuthState>({
-    isAuthenticated: false,
-    isLoading: true,
-    user: null,
-    tokens: null,
-    error: null,
-  });
+  const [isAuthenticated, setIsAuthenticated] = useState(
+    () => tokenManager.hasTokens(),
+  );
+  const [identity, setIdentity] = useState<UserIdentity | null>(
+    () => tokenManager.getIdentity(),
+  );
+  const refreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshPromiseRef = useRef<Promise<boolean> | null>(null);
 
-  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
-  const refreshTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const logout = useCallback(async () => {
+  // Shared refresh logic used by both proactive and reactive refresh.
+  const doRefresh = useCallback(async (): Promise<boolean> => {
+    const refreshToken = tokenManager.getRefreshToken();
+    if (!refreshToken) return false;
     try {
-      const currentTokens = tokenManager.getTokens();
-      if (currentTokens?.access_token) {
-        await authService.logout(currentTokens.access_token);
-      }
-    } catch (error) {
-      console.error(error);
-    } finally {
+      const resp = await axios.post("/api/v1/auth/session/refresh", {
+        refresh_token: refreshToken,
+      });
+      tokenManager.saveTokens({
+        access_token: resp.data.access_token,
+        refresh_token: resp.data.refresh_token,
+      });
+      setIsAuthenticated(true);
+      return true;
+    } catch {
       tokenManager.clearTokens();
-      if (refreshTimeoutRef.current) {
-        clearTimeout(refreshTimeoutRef.current);
-      }
-      setState({
-        isAuthenticated: false,
-        isLoading: false,
-        user: null,
-        tokens: null,
-        error: null,
+      setIsAuthenticated(false);
+      setIdentity(null);
+      return false;
+    }
+  }, []);
+
+  // Deduplicated refresh: multiple 401s only trigger one refresh request.
+  const refreshOnce = useCallback(async (): Promise<boolean> => {
+    if (!refreshPromiseRef.current) {
+      refreshPromiseRef.current = doRefresh().finally(() => {
+        refreshPromiseRef.current = null;
       });
     }
-  }, []);
+    return refreshPromiseRef.current;
+  }, [doRefresh]);
 
-  const refreshTokens = useCallback(async () => {
-    const currentTokens = tokenManager.getTokens();
-    if (!currentTokens?.refresh_token) {
-      throw new Error("No refresh token available");
+  // Schedule proactive refresh before the access token expires.
+  const scheduleProactiveRefresh = useCallback(() => {
+    if (refreshTimeoutRef.current) {
+      clearTimeout(refreshTimeoutRef.current);
+      refreshTimeoutRef.current = null;
     }
+    const ttl = tokenManager.getTimeUntilExpiry();
+    if (ttl <= 0) return;
+    // Refresh at half the remaining time, but at most 5 minutes before expiry.
+    const bufferMs = Math.min(5 * 60 * 1000, ttl / 2);
+    const delay = ttl - bufferMs;
+    if (delay <= 0) return;
+    refreshTimeoutRef.current = setTimeout(async () => {
+      const ok = await refreshOnce();
+      if (ok) scheduleProactiveRefresh();
+    }, delay);
+  }, [refreshOnce]);
 
-    try {
-      const newTokens = await authService.refreshSession(
-        currentTokens.refresh_token,
-      );
-      tokenManager.saveTokens(newTokens);
-
-      setState((prev) => ({
-        ...prev,
-        tokens: newTokens,
-      }));
-    } catch (error) {
-      await logout();
-      throw error;
-    }
-  }, [logout]);
-
-  const scheduleTokenRefresh = useCallback(
-    (tokens: AuthTokens): void => {
-      if (refreshTimeoutRef.current) {
-        clearTimeout(refreshTimeoutRef.current);
-      }
-
-      if (!tokens.expires_in) {
-        return;
-      }
-
-      const bufferTime = Math.min(
-        5 * 60 * 1000,
-        (tokens.expires_in * 1000) / 2,
-      );
-      const refreshIn = tokens.expires_in * 1000 - bufferTime;
-
-      if (refreshIn <= 0) {
-        return;
-      }
-
-      refreshTimeoutRef.current = setTimeout(async () => {
-        try {
-          await refreshTokens();
-        } catch (error) {
-          logout();
-        }
-      }, refreshIn);
-    },
-    [refreshTokens, logout],
-  );
-
+  // Set up axios interceptors (once, with cleanup).
   useEffect(() => {
-    setupAuthInterceptor(() => {
-      const tokens = tokenManager.getTokens();
-      return tokens?.access_token || null;
-    });
-
-    setupRefreshInterceptor(
-      () => tokenManager.getTokens()?.refresh_token || null,
-      async (refreshToken: string) =>
-        await authService.refreshSession(refreshToken),
-      (tokens: AuthTokens) => {
-        tokenManager.saveTokens(tokens);
-        setState((prev) => ({ ...prev, tokens }));
-      },
-      () => {
-        tokenManager.clearTokens();
-        setState({
-          isAuthenticated: false,
-          isLoading: false,
-          user: null,
-          tokens: null,
-          error: null,
-        });
+    const requestId = axiosInstance.interceptors.request.use(
+      (config: InternalAxiosRequestConfig) => {
+        const token = tokenManager.getAccessToken();
+        if (token) {
+          config.headers.set("Authorization", `Bearer ${token}`);
+        }
+        return config;
       },
     );
-  }, []);
 
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        const config = await authService.getAuthConfig();
-        setAuthConfig(config);
-
-        const tokens = tokenManager.getTokens();
-
-        if (!tokens) {
-          setState((prev) => ({
-            ...prev,
-            isLoading: false,
-            isAuthenticated: false,
-          }));
-          return;
-        }
-
-        if (tokenManager.isAccessTokenExpired(tokens)) {
-          try {
-            const newTokens = await authService.refreshSession(
-              tokens.refresh_token,
-            );
-            tokenManager.saveTokens(newTokens);
-
-            const user = await authService.getCurrentUser(
-              newTokens.access_token,
-            );
-
-            setState({
-              isAuthenticated: true,
-              isLoading: false,
-              user,
-              tokens: newTokens,
-              error: null,
-            });
-
-            scheduleTokenRefresh(newTokens);
-          } catch (error) {
-            tokenManager.clearTokens();
-            setState((prev) => ({
-              ...prev,
-              isLoading: false,
-              isAuthenticated: false,
-            }));
+    const responseId = axiosInstance.interceptors.response.use(
+      (response) => response,
+      async (error: AxiosError) => {
+        const original = error.config as InternalAxiosRequestConfig & {
+          _retry?: boolean;
+        };
+        if (
+          error.response?.status === 401 &&
+          original &&
+          !original._retry
+        ) {
+          original._retry = true;
+          if (tokenManager.getRefreshToken()) {
+            const ok = await refreshOnce();
+            if (ok) {
+              const token = tokenManager.getAccessToken();
+              if (token) {
+                original.headers.set("Authorization", `Bearer ${token}`);
+              }
+              return axiosInstance(original);
+            }
+            // Refresh failed — reload to reach login page.
+            window.location.reload();
           }
-        } else {
-          const user = await authService.getCurrentUser(tokens.access_token);
-          setState({
-            isAuthenticated: true,
-            isLoading: false,
-            user,
-            tokens,
-            error: null,
-          });
-
-          scheduleTokenRefresh(tokens);
+          // No refresh token: let the 401 propagate.
         }
-      } catch (error) {
-        setState((prev) => ({
-          ...prev,
-          isLoading: false,
-          error: "Failed to initialize authentication",
-        }));
-      }
+        return Promise.reject(error);
+      },
+    );
+
+    return () => {
+      axiosInstance.interceptors.request.eject(requestId);
+      axiosInstance.interceptors.response.eject(responseId);
     };
+  }, [refreshOnce]);
 
-    initAuth();
-
+  // On mount: if we have tokens but they're expired, try to refresh.
+  // Also schedule proactive refresh for valid tokens.
+  useEffect(() => {
+    if (!tokenManager.hasTokens()) return;
+    if (tokenManager.isAccessTokenExpired()) {
+      refreshOnce().then((ok) => {
+        if (ok) scheduleProactiveRefresh();
+      });
+    } else {
+      scheduleProactiveRefresh();
+    }
     return () => {
       if (refreshTimeoutRef.current) {
         clearTimeout(refreshTimeoutRef.current);
       }
     };
-  }, [scheduleTokenRefresh]);
+  }, [refreshOnce, scheduleProactiveRefresh]);
 
-  const login = async (
-    provider: string,
-    username: string,
-    password: string,
-  ) => {
-    try {
-      setState((prev) => ({ ...prev, isLoading: true, error: null }));
+  const onLogin = useCallback(
+    (accessToken: string, refreshToken: string, ident?: UserIdentity) => {
+      tokenManager.saveTokens({ access_token: accessToken, refresh_token: refreshToken }, ident);
+      setIsAuthenticated(true);
+      if (ident) setIdentity(ident);
+      scheduleProactiveRefresh();
+    },
+    [scheduleProactiveRefresh],
+  );
 
-      const tokens = await authService.loginWithPassword(
-        provider,
-        username,
-        password,
-      );
-
-      tokenManager.saveTokens(tokens);
-
-      const user = await authService.getCurrentUser(tokens.access_token);
-
-      setState({
-        isAuthenticated: true,
-        isLoading: false,
-        user,
-        tokens,
-        error: null,
-      });
-
-      scheduleTokenRefresh(tokens);
-    } catch (error: any) {
-      setState((prev) => ({
-        ...prev,
-        isLoading: false,
-        error: error.message || "Login failed",
-      }));
-      throw error;
+  const onLogout = useCallback(() => {
+    tokenManager.clearTokens();
+    setIsAuthenticated(false);
+    setIdentity(null);
+    if (refreshTimeoutRef.current) {
+      clearTimeout(refreshTimeoutRef.current);
+      refreshTimeoutRef.current = null;
     }
-  };
+  }, []);
 
   return (
     <AuthContext.Provider
       value={{
-        ...state,
-        login,
-        logout,
-        refreshTokens,
-        authConfig,
+        authRequired: authentication?.required ?? false,
+        providers: authentication?.providers ?? [],
+        isAuthenticated,
+        initialized: authentication !== null,
+        identity,
+        onLogin,
+        onLogout,
       }}
     >
       {children}

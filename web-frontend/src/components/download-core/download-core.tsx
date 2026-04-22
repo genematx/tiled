@@ -1,6 +1,8 @@
 import * as React from "react";
+
 import Select, { SelectChangeEvent } from "@mui/material/Select";
 import { useContext, useState } from "react";
+
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
@@ -12,10 +14,9 @@ import Popover from "@mui/material/Popover";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Tooltip from "@mui/material/Tooltip";
-import CircularProgress from "@mui/material/CircularProgress";
+import { axiosInstance } from "../../client";
 import copy from "clipboard-copy";
 import { SettingsContext } from "../../context/settings";
-import { tokenManager } from "../../auth/token-manager";
 
 interface Format {
   mimetype: string;
@@ -37,7 +38,6 @@ const Download: React.FunctionComponent<DownloadProps> = (props) => {
   const [anchorEl, setAnchorEl] = React.useState<HTMLButtonElement | null>(
     null,
   );
-  const [downloading, setDownloading] = useState(false);
 
   const handleLinkClick = (event: React.MouseEvent<HTMLButtonElement>) => {
     setAnchorEl(event.currentTarget);
@@ -58,102 +58,40 @@ const Download: React.FunctionComponent<DownloadProps> = (props) => {
     props.setFormat(format);
   };
 
+  const value = props.format !== undefined ? props.format.mimetype : "";
+
   const handleDownload = async () => {
     if (!props.link || !props.format) return;
-
+    const url = `${props.link}&filename=${props.name}${props.format.extension}`;
     try {
-      setDownloading(true);
-
-      const downloadUrl = `${props.link}&filename=${props.name}${props.format.extension}`;
-
-      const tokens = tokenManager.getTokens();
-      if (!tokens?.access_token) {
-        return;
-      }
-
-      const response = await fetch(downloadUrl, {
-        headers: {
-          Authorization: `Bearer ${tokens.access_token}`,
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const blob = await response.blob();
-
-      if (blob.size === 0) {
-        return;
-      }
-
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${props.name}${props.format.extension}`;
-      link.style.display = "none";
-
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-
-      setTimeout(() => {
-        URL.revokeObjectURL(url);
-      }, 1000);
-    } catch (error: any) {
-      console.error(error);
-      alert(error.message);
-    } finally {
-      setDownloading(false);
+      const resp = await axiosInstance.get(url, { responseType: "blob" });
+      const blobUrl = URL.createObjectURL(resp.data);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `${props.name}${props.format.extension}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(blobUrl);
+    } catch (e) {
+      console.error("Download failed", e);
     }
   };
 
   const handleOpen = async () => {
     if (!props.link) return;
-
     try {
-      setDownloading(true);
-
-      const tokens = tokenManager.getTokens();
-      if (!tokens?.access_token) {
-        return;
-      }
-
-      const response = await fetch(props.link, {
-        headers: {
-          Authorization: `Bearer ${tokens.access_token}`,
-        },
+      const resp = await axiosInstance.get(props.link, {
+        responseType: "blob",
       });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const blob = await response.blob();
-
-      if (blob.size === 0) {
-        return;
-      }
-
-      const url = URL.createObjectURL(blob);
-      const newWindow = window.open(url, "_blank");
-
-      if (!newWindow) {
-        URL.revokeObjectURL(url);
-        return;
-      }
-
-      setTimeout(() => {
-        URL.revokeObjectURL(url);
-      }, 5000);
-    } catch (error: any) {
-      alert(error.message);
-    } finally {
-      setDownloading(false);
+      const blobUrl = URL.createObjectURL(resp.data);
+      window.open(blobUrl, "_blank");
+      // Revoke after a delay to allow the new tab to load
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+    } catch (e) {
+      console.error("Open failed", e);
     }
   };
-
-  const value = props.format !== undefined ? props.format.mimetype : "";
 
   return (
     <Stack spacing={2} direction="column">
@@ -184,37 +122,27 @@ const Download: React.FunctionComponent<DownloadProps> = (props) => {
       <Stack spacing={1} direction="row">
         <Tooltip title="Download to a file">
           <span>
-            {
-              // The filename query parameter cues the server to set the
-              // Content-Disposition header which prompts the browser to open
-              // a "Save As" dialog initialized with the specified filename.
-            }
             <Button
               variant="outlined"
               onClick={handleDownload}
-              disabled={!props.link || !props.format || downloading}
-              startIcon={
-                downloading ? <CircularProgress size={20} /> : undefined
-              }
+              {...(props.link ? {} : { disabled: true })}
             >
-              {downloading ? "Downloading..." : "Download"}
+              Download
             </Button>
           </span>
         </Tooltip>
-
         <Tooltip title="Get a URL to this specific data">
           <span>
             <Button
               aria-describedby={id}
               variant="outlined"
-              disabled={!props.link}
+              {...(props.link ? {} : { disabled: true })}
               onClick={handleLinkClick}
             >
               Link
             </Button>
           </span>
         </Tooltip>
-
         <Popover
           id={id}
           open={open}
@@ -255,13 +183,12 @@ const Download: React.FunctionComponent<DownloadProps> = (props) => {
             </Tooltip>
           </Box>
         </Popover>
-
         <Tooltip title="Open in a new tab (if format is supported by web browser)">
           <span>
             <Button
               variant="outlined"
               onClick={handleOpen}
-              disabled={!props.link || downloading}
+              {...(props.link ? {} : { disabled: true })}
             >
               Open
             </Button>
