@@ -10,12 +10,13 @@ import time
 from typing import Optional, Union, cast
 from urllib.parse import quote_plus, urlparse
 
+import httpx
 import uvicorn
 
 from ..storage import SQLStorage, get_storage
 from ..utils import ensure_uri
 
-_server_is_running = False
+_STARTUP_TIMEOUT = 20  # seconds; used for both socket listen and readiness checks
 
 
 class ThreadedServer(uvicorn.Server):
@@ -24,29 +25,23 @@ class ThreadedServer(uvicorn.Server):
 
     @contextlib.contextmanager
     def run_in_thread(self):
-        global _server_is_running
-
-        if _server_is_running:
-            raise RuntimeError(
-                "Only one server can be run at a time " "in a given Python process."
-            )
-        _server_is_running = True
-        thread = threading.Thread(target=self.run)
-        thread.start()
+        self.thread = threading.Thread(target=self.run)
+        self.thread.start()
         try:
             # Wait for server to start up, or raise TimeoutError.
-            for _ in range(200):
+            for _ in range(int(_STARTUP_TIMEOUT / 0.1)):
                 time.sleep(0.1)
                 if self.started:
                     break
             else:
-                raise TimeoutError("Server did not start in 20 seconds.")
+                raise TimeoutError(
+                    f"Server did not start in {_STARTUP_TIMEOUT} seconds."
+                )
             host, port = self.servers[0].sockets[0].getsockname()
             yield f"http://{host}:{port}"
         finally:
             self.should_exit = True
-            thread.join()
-            _server_is_running = False
+            self.thread.join()
 
 
 class SimpleTiledServer:
@@ -60,14 +55,17 @@ class SimpleTiledServer:
     Parameters
     ----------
     directory : Optional[Path, str]
-        Location where data and embedded databases will be stored.
-        By default, a temporary directory will be used.
+        Location where data, including files and embedded databases, will be
+        stored. By default, a temporary directory will be used.
     api_key : Optional[str]
         By default, an 8-bit random secret is generated. (Production Tiled
         servers use longer secrets.)
     port : Optional[int]
         Port the server will listen on. By default, a random free high port
         is allocated by the operating system.
+    readable_storage : Optional[Union[str, pathlib.Path, list[Union[str, pathlib.Path]]]
+        If provided, the server will be able to read from these storage locations, in addition
+        to the default storage location defined by `directory`.
 
     Examples
     --------
@@ -93,11 +91,13 @@ class SimpleTiledServer:
         directory: Optional[Union[str, pathlib.Path]] = None,
         api_key: Optional[str] = None,
         port: int = 0,
-        readable_storage: Optional[Union[str, pathlib.Path]] = None,
+        readable_storage: Optional[
+            Union[str, pathlib.Path, list[Union[str, pathlib.Path]]]
+        ] = None,
     ):
         # Delay import to avoid circular import.
         from ..catalog import from_uri as catalog_from_uri
-        from ..config import Authentication
+        from ..config import Authentication, StreamingCacheConfig
         from .app import build_app
         from .logging_config import LOGGING_CONFIG
 
@@ -126,19 +126,65 @@ class SimpleTiledServer:
         del log_config["handlers"]["default"]["stream"]
         log_config["handlers"]["default"]["filename"] = str(directory / "error.log")
 
+        # Catalog from uri wants readable storage to be a list,
+        # but we want to allow users to pass in a single path (as a str or pathlib.Path)
+        # for convenience.
+        if readable_storage is not None and (
+            isinstance(readable_storage, str)
+            or isinstance(readable_storage, pathlib.Path)
+        ):
+            readable_storage = [readable_storage]
+
         self.catalog = catalog_from_uri(
             directory / "catalog.db",
             writable_storage=[directory / "data", storage_uri],
             init_if_not_exists=True,
             readable_storage=readable_storage,
+            cache_config=StreamingCacheConfig(uri="memory").model_dump(),
         )
         self.app = build_app(
             self.catalog, authentication=Authentication(single_user_api_key=api_key)
         )
-        self._cm = ThreadedServer(
+        self._server = ThreadedServer(
             uvicorn.Config(self.app, port=port, loop="asyncio", log_config=log_config)
-        ).run_in_thread()
+        )
+        self._cm = self._server.run_in_thread()
         base_url = self._cm.__enter__()
+
+        # ThreadedServer.started is True as soon as uvicorn opens the
+        # socket, but FastAPI does not serve requests until the lifespan
+        # startup_event() completes. Poll /healthz to wait for that.
+        # Ensure the background server thread is shut down if anything
+        # in the readiness probe fails; otherwise it would leak.
+        try:
+            deadline = time.monotonic() + _STARTUP_TIMEOUT
+            with httpx.Client(trust_env=False) as client:
+                while True:
+                    if not self._server.thread.is_alive():
+                        raise RuntimeError(
+                            "Tiled server thread exited before the application "
+                            "became ready. Check the log files in the server's "
+                            f"directory for details: {directory}"
+                        )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "Tiled server started listening but the application "
+                            f"did not become ready within {_STARTUP_TIMEOUT} seconds."
+                        )
+                    try:
+                        r = client.get(
+                            f"{base_url}/healthz",
+                            timeout=min(1.0, remaining),
+                        )
+                        if r.status_code == 200:
+                            break
+                    except httpx.RequestError:
+                        pass
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        except BaseException:
+            self._cm.__exit__(None, None, None)
+            raise
 
         # Extract port from base_url.
         actual_port = urlparse(base_url).port

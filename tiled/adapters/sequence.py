@@ -1,8 +1,6 @@
 import builtins
-import math
-import warnings
 from abc import abstractmethod
-from typing import Any, Iterable, List, Optional, Tuple, Union
+from typing import Any, Iterable, List, Optional, Union
 
 import numpy as np
 from ndindex import ndindex
@@ -10,56 +8,14 @@ from numpy._typing import NDArray
 
 from tiled.adapters.core import Adapter
 
-from ..adapters.array import slice_and_shape_from_block_and_chunks
 from ..catalog.orm import Node
-from ..ndslice import NDSlice
+from ..ndslice import NDBlock, NDSlice
 from ..structures.array import ArrayStructure, BuiltinDtype
 from ..structures.core import Spec, StructureFamily
 from ..structures.data_source import DataSource
 from ..type_aliases import JSON, EllipsisType
 from ..utils import path_from_uri
-from .utils import init_adapter_from_catalog
-
-
-def force_reshape(arr: np.array, desired_shape: Tuple[int, ...]) -> np.array:
-    """Reshape a numpy array to match the desired shape, if possible.
-
-    Parameters
-    ----------
-
-    arr : np.array
-        The original ND array to be reshaped
-    desired_shape : Tuple[int, ...]
-        The desired shape of the resulting array
-
-    Returns
-    -------
-
-    A view of the original array
-    """
-
-    if arr.shape == desired_shape:
-        # Nothing to do here
-        return arr
-
-    if arr.size == math.prod(desired_shape):
-        if len(arr.shape) != len(desired_shape):
-            # Missing or extra singleton dimensions
-            warnings.warn(
-                f"Forcefully reshaping {arr.shape} to {desired_shape}",
-                category=RuntimeWarning,
-            )
-            return arr.reshape(desired_shape)
-        else:
-            # Some dimensions might be swapped or completely wrong
-            # TODO: needs to be treated more carefully
-            pass
-
-    warnings.warn(
-        f"Can not reshape array of {arr.shape} to match {desired_shape}; proceeding without changes",
-        category=RuntimeWarning,
-    )
-    return arr
+from .utils import force_reshape, init_adapter_from_catalog
 
 
 class FileSequenceAdapter(Adapter[ArrayStructure]):
@@ -179,14 +135,16 @@ class FileSequenceAdapter(Adapter[ArrayStructure]):
                 left_axis, *the_rest = slice
                 # Could be int or slice (i, ...) or (slice(...), ...); the_rest is converted to a list
                 if isinstance(left_axis, int):
-                    # e.g. read(slice=(0, ....))
+                    # e.g. read(slice=(0, ....)), dimensionality is reduced by 1
                     arr = np.squeeze(self._load_from_files(left_axis), 0)
                 elif left_axis is Ellipsis:
-                    # Return all images
+                    # Return all images; include any leading dimensions
                     arr = self._load_from_files()
-                    the_rest.insert(0, Ellipsis)  # Include any leading dimensions
+                    the_rest.insert(0, Ellipsis)
                 elif isinstance(left_axis, builtins.slice):
+                    # Include the first dimension when further subslicing
                     arr = self.read(slice=left_axis)
+                    the_rest.insert(0, builtins.slice(None))
 
                 sliced_shape = ndindex(left_axis).newshape(self.structure().shape)
                 arr = force_reshape(arr, sliced_shape)
@@ -196,22 +154,9 @@ class FileSequenceAdapter(Adapter[ArrayStructure]):
         sliced_shape = ndindex(slice).newshape(self.structure().shape)
         return force_reshape(arr, sliced_shape)
 
-    def read_block(
-        self, block: Tuple[int, ...], slice: NDSlice = NDSlice(...)
-    ) -> NDArray[Any]:
-        """
-
-        Parameters
-        ----------
-        block :
-        slice :
-
-        Returns
-        -------
-
-        """
+    def read_block(self, block: NDBlock, slice: NDSlice = NDSlice(...)) -> NDArray[Any]:
         if any(block[1:]):
             raise IndexError(block)
-        slice_, _ = slice_and_shape_from_block_and_chunks(block, self._structure.chunks)
-        arr = self.read(slice_[0])
+        block_slice = block.slice_from_chunks(self._structure.chunks)
+        arr = self.read(block_slice[0])
         return arr[slice] if slice else arr

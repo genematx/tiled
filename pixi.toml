@@ -51,6 +51,7 @@ pyarrow-all = ">=14.0.1"  # includes fix to CVE 2023-47248
 aiohttp = "*"
 coverage = "*"
 flake8 = "*"
+hypothesis = "*"
 ipython = "*"
 ldap3 = "*"
 matplotlib = "*"
@@ -93,10 +94,11 @@ cachetools = "*"
 canonicaljson = "*"
 dask = "*"
 duckdb = "<1.4.0"  # https://github.com/bluesky/tiled/issues/1144
-fastapi = ">=0.122.0"
+fastapi = ">=0.132.0"
 jinja2 = "*"
 jmespath = "*"
 numcodecs = "*"
+obstore = "*"
 packaging = "*"
 prometheus_client = "*"
 python-dateutil = "*"
@@ -118,10 +120,6 @@ dask = "*"
 pandas = "*"
 pyarrow-all = ">=14.0.1"  # includes fix to CVE 2023-47248
 xarray = "*"
-
-[feature.py39.dependencies]
-python = "3.13.*"
-# python-blosc2 is not available for Python 3.9
 
 [feature.py310.dependencies]
 python = "3.10.*"
@@ -146,7 +144,6 @@ client = { features = ["array", "awkward", "client", "compression", "dataframe",
 dev = { features = ["array", "awkward", "client", "compression", "dataframe", "formats", "dev", "server", "sparse", "xarray"], solve-group = "default" }
 server = { features = ["array", "awkward", "compression", "dataframe", "formats", "server", "sparse", "xarray"], solve-group = "default" }
 
-py39  = { features = ["array", "awkward", "client", "compression", "dataframe", "formats", "dev", "server", "sparse", "xarray", "py39"] }
 py310 = { features = ["array", "awkward", "client", "compression", "dataframe", "formats", "dev", "server", "sparse", "xarray", "py310"] }
 py311 = { features = ["array", "awkward", "client", "compression", "dataframe", "formats", "dev", "server", "sparse", "xarray", "py311"] }
 py312 = { features = ["array", "awkward", "client", "compression", "dataframe", "formats", "dev", "server", "sparse", "xarray", "py312"] }

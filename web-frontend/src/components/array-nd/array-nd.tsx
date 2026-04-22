@@ -11,8 +11,7 @@ import useMediaQuery from "@mui/material/useMediaQuery";
 import { useState, useEffect } from "react";
 import { useTheme } from "@mui/material/styles";
 import { axiosInstance } from "../../client";
-import { tokenManager } from "../../auth/token-manager";
-import { useAuth } from "../../auth/auth-context";
+
 
 interface IProps {
   segments: string[];
@@ -104,7 +103,6 @@ const ImageDisplay: React.FunctionComponent<ImageDisplayProps> = (props) => {
   const [imageSrc, setImageSrc] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
-  const {tokens} = useAuth();
 
   useEffect(() => {
     let cancelled = false;
@@ -115,15 +113,14 @@ const ImageDisplay: React.FunctionComponent<ImageDisplayProps> = (props) => {
         setLoading(true);
         setError("");
 
-        let url = `${props.link}?format=image/png&slice=${props.cuts.join(",")}`;
+        const sliceParts = props.cuts.map((c) => c.toString());
         if (props.stride !== 1) {
-          url += `,::${props.stride},::${props.stride}`;
+          sliceParts.push(`::${props.stride}`, `::${props.stride}`);
         }
-
-        const token = tokens?.access_token;
-        if (!token) {
-          throw new Error("No authentication token available");
-        }
+        const url =
+          sliceParts.length > 0
+            ? `${props.link}?format=image/png&slice=${sliceParts.join(",")}`
+            : `${props.link}?format=image/png`;
 
         const response = await axiosInstance.get(url, {
           responseType: "blob",
@@ -136,7 +133,9 @@ const ImageDisplay: React.FunctionComponent<ImageDisplayProps> = (props) => {
         }
       } catch (err: any) {
         if (!cancelled) {
-          setError(err.response?.data?.message || err.message || "Failed to load image");
+          setError(
+            err.response?.data?.message || err.message || "Failed to load image",
+          );
           setLoading(false);
         }
       }
@@ -150,7 +149,7 @@ const ImageDisplay: React.FunctionComponent<ImageDisplayProps> = (props) => {
         URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [props.link, props.cuts.join(","), props.stride, tokens?.access_token]);
+  }, [props.link, props.cuts.join(","), props.stride]);
 
   if (loading) {
     return (
