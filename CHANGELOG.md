@@ -3,6 +3,115 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 # Changelog
 
+
+## Unreleased
+
+### Fixed
+
+- Writing chunked (dask) arrays with single chunk along all dimensions
+- OIDC authenticator was not quite compfixedliant and was incompatible with
+  at least some providers including Azure and ORCID.
+- Improved performance of reading zarr arrays when slicing by avoiding reading
+  the full arrays into memory, but using slice composition instead.
+- Ensure that JSON payloads in streaming endpoints is properly decoded.
+- A bug in `TiledAuth` when `token_directory` is `None` caused an
+  error during token refresh.
+- Resolve syntax error caused by a return statement in a finally block
+  on Python 3.14+.
+
+### Changed
+
+- Array client fully supports slicing when communicating with the server
+  and only fetches the data needed to satisfy the slice.
+- CSVArrayAdapter supports reading heterogenous tables as structured arrays
+
+### Added
+
+- Tests for the WebSocket endpoints that stream tabukar data.
+
+## v0.2.7 (2026-02-27)
+
+### Fixed
+
+- A potential race condition when subscribing to an already started stream
+  and receiving replayed messages before the subscription is fully set up.
+- Tests and examples that use example config files; specifically an external
+  NeXus file used as an example of the structure is generated dynamically at
+  test time now.
+- Type hint for `readable_storage` parameter for `SimpleTiledServer` indicated it
+  should be a string or `Path`, but it actually was required to be a list of strings
+  or list of `Paths`. This has been fixed.
+- Missing docstring for `readable_storage` parameter added.
+- Missing `properties` field in the `put_data_source` method on the adapter.
+- Web frontend image retrieval for 2D arrays with downsampling.
+
+### Changed
+
+- The `start_in_thread` method of `Subscription` now waits until the WebSocket
+  connection is established before returning.
+- Allow for passing a single string or `Path` to `SimpleTiledServer`'s `readable_storage`
+  parameter. Generally, when using `SimpleTiledServer` one usually just passes `/tmp` or
+  `tmp_path` in unit tests.
+- Unit test that confirms that the `readable_storage` setting works as expected, with
+  it being passed as a string, `Path`, list of strings, or list of `Path`s.
+- Cancel previous CI runs on a PR when further commits are pushed to reduce
+  CI processing time.
+
+## v0.2.7 (2026-02-27)
+
+### Fixed
+
+- Raise an error with a suitable message when trying to create an API key
+  on a server that does not support it.
+- Backwards compatibility with older servers that do not support the `properties`
+  field in `DataSource` objects. The client will now omit this field when
+  communicating with servers older than v0.2.4.
+
+## v0.2.6 (2026-02-24)
+
+### Fixed
+
+- Explicitly specified `"Content-Type": "application/json"` in the request
+  headers to comply with stricter payload parsing in FastAPI >= 0.132.0.
+- Servers started by the new function `tiled.client.simple` did not stop
+  cleanly at interpreter shutdown, causing a hangup.
+
+## v0.2.5 (2026-02-20)
+
+### Added
+
+- A new function `tiled.client.simple` provides a convenient method for
+  obtaining a client backed by a `SimpleTiledServer`.
+
+### Changed
+
+- The `SimpleTiledServer` no longer prohibits multiple servers per process.
+  This is convenient for rapidly iterating with new temporary servers.
+- The `SimpleTiledServer` supports streaming, via the in-memory TTL cache
+  introduced in v0.2.4.
+
+## v0.2.4 (2026-02-18)
+
+### Added
+
+- Support for including custom FastAPI routers via a new `routers` configuration
+  field at the server level.
+
+### Changed
+
+- Arrays accessed by `ArrayAdapter`, its subclasses, and related adapters (e.g. `HDF5ArrayAdapter`,
+  `FileSequenceAdapter`) are reshaped by default to match the shape declared in the
+  associated structure, where possible.
+- Removed support for Python 3.9, which reached its end of life in October 2025.
+- When creating an access-tag restricted API key, the `inherit` scope is no longer valid to request. Instead, the specific scopes desired for the key should be requested.
+
+### Fixed
+
+- Error handling in `tiled.client.download._download_url`.
+- Slow performance when deleting nodes in large catalogs with many nodes.
+- Add `properties` field to the DataSource object and table, to store additional
+  metadata about the data source (e.g. array chunking information).
+
 ## v0.2.3 (2025-12-17)
 
 ### Added

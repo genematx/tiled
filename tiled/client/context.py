@@ -290,6 +290,8 @@ class Context:
             if len(self.server_info.authentication.providers) == 1
             else None
         )
+        # To determine httpx.Auth used by Tiled client is TiledAuth(internal) or external Auth
+        self.has_external_auth = False
 
     def __repr__(self):
         auth_info = []
@@ -558,11 +560,20 @@ class Context:
         """
         if isinstance(expires_in, str):
             expires_in = parse_time_string(expires_in)
+
+        authn_links = self.server_info.authentication.links
+        if (authn_links is None) or (not authn_links.apikey):
+            raise RuntimeError(
+                "This Tiled server is deployed as a single-user server. "
+                "Unlike multi-user servers, it has a single, static API key and does not "
+                "support generating additional API keys."
+            )
+
         for attempt in retry_context():
             with attempt:
                 return handle_error(
                     self.http_client.post(
-                        self.server_info.authentication.links.apikey,
+                        authn_links.apikey,
                         headers={"Accept": MSGPACK_MIME_TYPE},
                         json={
                             "scopes": scopes,
