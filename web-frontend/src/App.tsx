@@ -50,22 +50,27 @@ function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    async function init() {
-      try {
-        const [settingsData, aboutData] = await Promise.all([
-          fetchSettings(controller.signal),
-          about(),
-        ]);
-        setSettings(settingsData);
-        setAuthentication(aboutData.authentication);
-      } catch (err) {
+
+    // Fetch settings independently — failure should not block auth init.
+    fetchSettings(controller.signal)
+      .then(setSettings)
+      .catch((err) => {
         if (!controller.signal.aborted) {
-          console.error("Failed to initialize app:", err);
-          setAuthentication({ required: false, providers: [] });
+          console.error("Failed to fetch UI settings:", err);
         }
-      }
-    }
-    init();
+      });
+
+    // Fetch server info to determine auth requirements.
+    // On failure, keep authentication=null (initialized=false) so RequireAuth
+    // shows a loading skeleton rather than incorrectly bypassing login.
+    about()
+      .then((data) => setAuthentication(data.authentication))
+      .catch((err) => {
+        if (!controller.signal.aborted) {
+          console.error("Failed to fetch server info:", err);
+        }
+      });
+
     return () => controller.abort();
   }, []);
 
