@@ -16,7 +16,7 @@ Write the date in place of the "Unreleased" in the case a new version is release
   silent data corruption. The server now raises a clear error at startup if the
   mount node does not exist.
 - Writing chunked (dask) arrays with single chunk along all dimensions
-- OIDC authenticator was not quite compfixedliant and was incompatible with
+- OIDC authenticator was not quite compliant and was incompatible with
   at least some providers including Azure and ORCID.
 - Improved performance of reading zarr arrays when slicing by avoiding reading
   the full arrays into memory, but using slice composition instead.
