@@ -91,7 +91,7 @@ class RaggedStructure(Structure):
             resizable=False,
             size=size,
             partitions=partitions,
-            nbytes=nbytes
+            nbytes=nbytes,
         )
 
     @classmethod
