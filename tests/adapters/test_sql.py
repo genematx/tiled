@@ -22,25 +22,20 @@ names = ["f0", "f1", "f2", "f3"]
 data0 = [
     pa.array([1, 2, 3, 4, 5]),
     pa.array([1.0, 2.0, 3.0, 4.0, 5.0]),
-    # pa.array(["foo0", "bar0", "baz0", None, "goo0"]),
-    # pa.array([True, None, False, True, None]),
-    pa.array(["foo0", "bar0", "baz0", "None", "goo0"]),
-    pa.array([True, bool(None), False, True, bool(None)]),
+    pa.array(["foo0", "bar0", "baz0", None, "goo0"]),
+    pa.array([True, None, False, True, None]),
 ]
 data1 = [
     pa.array([6, 7, 8, 9, 10, 11, 12]),
     pa.array([6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
-    # pa.array(["foo1", "bar1", None, "baz1", "biz", None, "goo"]),
-    # pa.array([None, True, True, False, False, None, True]),
-    pa.array(["foo1", "bar1", "None", "baz1", "biz", "None", "goo"]),
-    pa.array([bool(None), True, True, False, False, bool(None), True]),
+    pa.array(["foo1", "bar1", None, "baz1", "biz", None, "goo"]),
+    pa.array([None, True, True, False, False, None, True]),
 ]
 data2 = [
     pa.array([13, 14]),
     pa.array([13.0, 14.0]),
     pa.array(["foo2", "baz2"]),
-    # pa.array([False, None]),
-    pa.array([False, bool(None)]),
+    pa.array([False, None]),
 ]
 
 batch0 = pa.record_batch(data0, names=names)
