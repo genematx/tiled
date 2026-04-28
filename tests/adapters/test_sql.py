@@ -5,7 +5,6 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from tiled.adapters.array import ArrayAdapter
 from tiled.adapters.sql import (
     COLUMN_NAME_PATTERN,
     TABLE_NAME_PATTERN,
@@ -798,38 +797,3 @@ def test_append_nullable(
     assert deep_array_equal(result_part, result_full)
 
     storage.dispose()  # Close all connections
-
-
-@pytest.mark.parametrize(
-    "sql_adapter_name",
-    [
-        "adapter_duckdb_many_partitions",
-        "adapter_psql_many_partitions",
-        "adapter_sqlite_many_partitions",
-    ],
-)
-@pytest.mark.parametrize("field", names)
-def test_compare_field_data_from_array_adapter(
-    sql_adapter_name: str,
-    field: str,
-    request: pytest.FixtureRequest,
-) -> None:
-    # get adapter from fixture
-    sql_adapter: SQLAdapter = request.getfixturevalue(sql_adapter_name)
-
-    table = pa.Table.from_batches([batch0, batch1, batch2])
-    sql_adapter.append_partition(0, table)
-
-    array_adapter = sql_adapter[field]
-    assert isinstance(array_adapter, ArrayAdapter)
-
-    result_read = array_adapter.read()
-    field_index = names.index(field)
-    assert np.array_equal(
-        [
-            *data0[field_index].tolist(),
-            *data1[field_index].tolist(),
-            *data2[field_index].tolist(),
-        ],
-        result_read.tolist(),
-    )

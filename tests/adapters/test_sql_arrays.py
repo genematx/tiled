@@ -1,8 +1,11 @@
-from typing import Callable, cast
+from pathlib import Path
+from typing import Callable, Dict, Generator, Type, Union, cast
 
+import awkward as ak
 import numpy as np
 import pyarrow as pa
 import pytest
+import ragged
 
 from tests.adapters.test_sql import adapter_duckdb_many_partitions  # noqa: F401
 from tests.adapters.test_sql import adapter_duckdb_one_partition  # noqa: F401
@@ -12,10 +15,11 @@ from tests.adapters.test_sql import assert_same_rows
 from tiled.adapters.array import ArrayAdapter
 from tiled.adapters.ragged import RaggedAdapter
 from tiled.adapters.sql import SQLAdapter
-from tiled.storage import SQLStorage, parse_storage, register_storage
+from tiled.storage import SQLStorage, get_storage, parse_storage, register_storage
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import DataSource, Management
 from tiled.structures.table import TableStructure
+from tiled.utils import sanitize_uri
 
 rng = np.random.default_rng(42)
 
@@ -258,60 +262,127 @@ def test_write_read_one_batch_many_part(
     )
 
 
-# ---------------------------------------------------------------------------
 # Ragged-specific tests: verify that SQL columns containing variable-length
-# arrays are exposed as RaggedAdapter (not ArrayAdapter).
-# ---------------------------------------------------------------------------
+# arrays are exposed as the correct adapter type and read back correctly.
 
-_rng_ragged = np.random.default_rng(7)
-_ragged_names = ["integers", "floats", "ragged_floats"]
-_ragged_batch_size = 5
-_ragged_data0 = [
-    pa.array([_rng_ragged.integers(-100, 100, size=10) for _ in range(_ragged_batch_size)]),
-    pa.array([_rng_ragged.random(size=15) for _ in range(_ragged_batch_size)]),
-    pa.array([_rng_ragged.random(size=_rng_ragged.integers(1, 10)) for _ in range(_ragged_batch_size)]),
+ragged_names = ["integers", "floats", "ragged_floats"]
+ragged_names_adapters: Dict[str, Type[Union[ArrayAdapter, RaggedAdapter]]] = {
+    "integers": ArrayAdapter,
+    "floats": ArrayAdapter,
+    "ragged_floats": RaggedAdapter,
+}
+batch_size = 5
+ragged_data0 = [
+    pa.array([rng.integers(-100, 100, size=10) for _ in range(batch_size)]),
+    pa.array([rng.random(size=15) for _ in range(batch_size)]),
+    pa.array([rng.random(size=rng.integers(1, 10)) for _ in range(batch_size)]),
 ]
-_ragged_batch_size = 8
-_ragged_data1 = [
-    pa.array([_rng_ragged.integers(-100, 100, size=10) for _ in range(_ragged_batch_size)]),
-    pa.array([_rng_ragged.random(size=15) for _ in range(_ragged_batch_size)]),
-    pa.array([_rng_ragged.random(size=_rng_ragged.integers(1, 10)) for _ in range(_ragged_batch_size)]),
+batch_size = 8
+ragged_data1 = [
+    pa.array([rng.integers(-100, 100, size=10) for _ in range(batch_size)]),
+    pa.array([rng.random(size=15) for _ in range(batch_size)]),
+    pa.array([rng.random(size=rng.integers(1, 10)) for _ in range(batch_size)]),
 ]
-_ragged_batch_size = 3
-_ragged_data2 = [
-    pa.array([_rng_ragged.integers(-100, 100, size=10) for _ in range(_ragged_batch_size)]),
-    pa.array([_rng_ragged.random(size=15) for _ in range(_ragged_batch_size)]),
-    pa.array([_rng_ragged.random(size=_rng_ragged.integers(1, 10)) for _ in range(_ragged_batch_size)]),
+batch_size = 3
+ragged_data2 = [
+    pa.array([rng.integers(-100, 100, size=10) for _ in range(batch_size)]),
+    pa.array([rng.random(size=15) for _ in range(batch_size)]),
+    pa.array([rng.random(size=rng.integers(1, 10)) for _ in range(batch_size)]),
 ]
+ragged_batch0 = pa.record_batch(ragged_data0, names=ragged_names)
+ragged_batch1 = pa.record_batch(ragged_data1, names=ragged_names)
+ragged_batch2 = pa.record_batch(ragged_data2, names=ragged_names)
+ragged_table = pa.Table.from_batches([ragged_batch0, ragged_batch1, ragged_batch2])
 
-_ragged_batch0 = pa.record_batch(_ragged_data0, names=_ragged_names)
-_ragged_batch1 = pa.record_batch(_ragged_data1, names=_ragged_names)
-_ragged_batch2 = pa.record_batch(_ragged_data2, names=_ragged_names)
+
+@pytest.fixture
+def ragged_data_source_from_init_storage() -> (
+    Callable[[str, int], DataSource[TableStructure]]
+):
+    def _init(data_uri: str, num_partitions: int) -> DataSource[TableStructure]:
+        structure = TableStructure.from_arrow_table(
+            ragged_table, npartitions=num_partitions
+        )
+        data_source = DataSource(
+            management=Management.writable,
+            mimetype="application/x-tiled-sql-table",
+            structure_family=StructureFamily.table,
+            structure=structure,
+            assets=[],
+        )
+        storage = cast(SQLStorage, parse_storage(data_uri))
+        register_storage(storage)
+        return SQLAdapter.init_storage(data_source=data_source, storage=storage)
+
+    return _init
 
 
-@pytest.mark.parametrize(
-    "sql_adapter_name",
-    [("adapter_duckdb_many_partitions"), ("adapter_psql_many_partitions")],
-)
-@pytest.mark.parametrize(
-    ("field", "expected_adapter_type"),
-    [
-        ("integers", ArrayAdapter),
-        ("floats", ArrayAdapter),
-        ("ragged_floats", RaggedAdapter),
+@pytest.fixture
+def ragged_adapter_duckdb(
+    tmp_path: Path,
+    ragged_data_source_from_init_storage: Callable[
+        [str, int], DataSource[TableStructure]
     ],
+    duckdb_uri: str,
+) -> Generator[SQLAdapter, None, None]:
+    data_source = ragged_data_source_from_init_storage(duckdb_uri, 1)
+    yield SQLAdapter(
+        data_source.assets[0].data_uri,
+        data_source.structure,
+        data_source.parameters["table_name"],
+        data_source.parameters["dataset_id"],
+    )
+
+
+@pytest.fixture
+def ragged_adapter_psql(
+    ragged_data_source_from_init_storage: Callable[
+        [str, int], DataSource[TableStructure]
+    ],
+    postgres_uri: str,
+) -> Generator[SQLAdapter, None, None]:
+    data_source = ragged_data_source_from_init_storage(postgres_uri, 1)
+    yield SQLAdapter(
+        data_source.assets[0].data_uri,
+        data_source.structure,
+        data_source.parameters["table_name"],
+        data_source.parameters["dataset_id"],
+    )
+    storage = get_storage(sanitize_uri(postgres_uri)[0])
+    cast(SQLStorage, storage).dispose()
+
+
+@pytest.mark.parametrize(
+    "sql_adapter_fixture",
+    ["ragged_adapter_duckdb", "ragged_adapter_psql"],
 )
-def test_ragged_column_adapter_type(
-    sql_adapter_name: str,
+@pytest.mark.parametrize(
+    ("field", "expected_adapter_type"), [*ragged_names_adapters.items()]
+)
+def test_ragged_column_adapter_type_and_data(
+    sql_adapter_fixture: str,
     field: str,
     expected_adapter_type: type,
     request: pytest.FixtureRequest,
 ) -> None:
-    """SQL columns with variable-length list arrays should be exposed as RaggedAdapter."""
-    sql_adapter: SQLAdapter = request.getfixturevalue(sql_adapter_name)
-
-    table = pa.Table.from_batches([_ragged_batch0, _ragged_batch1, _ragged_batch2])
-    sql_adapter.append_partition(0, table)
+    """SQL columns with variable-length list arrays should be exposed as RaggedAdapter;
+    fixed-size array columns should be exposed as ArrayAdapter. Data round-trips correctly.
+    """
+    sql_adapter: SQLAdapter = request.getfixturevalue(sql_adapter_fixture)
+    sql_adapter.append_partition(0, ragged_table)
 
     child_adapter = sql_adapter[field]
     assert isinstance(child_adapter, expected_adapter_type)
+
+    field_index = ragged_names.index(field)
+    result_read = child_adapter.read()
+
+    assert isinstance(result_read, (np.ndarray, ragged.array))
+    assert ak.array_equal(
+        [
+            *ragged_data0[field_index].tolist(),
+            *ragged_data1[field_index].tolist(),
+            *ragged_data2[field_index].tolist(),
+        ],
+        result_read.tolist(),
+    )
