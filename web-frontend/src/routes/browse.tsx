@@ -39,7 +39,10 @@ const NodeOverview = lazy(
   () => import("../components/overview-generic-node/overview-generic-node"),
 );
 
-// Cache of loaded script URLs to avoid duplicate <script> tags
+// Cache of loaded script URLs to avoid duplicate <script> tags.
+// Once a script has loaded and its IIFE has executed (registering the
+// component on window.__TILED_SPEC_VIEWS__), there is no need to load
+// it again — even if the <script> element is removed from the DOM.
 const loadedScripts = new Set<string>();
 
 function loadScript(url: string): Promise<void> {
@@ -52,7 +55,11 @@ function loadScript(url: string): Promise<void> {
       loadedScripts.add(url);
       resolve();
     };
-    script.onerror = () => reject(new Error(`Failed to load spec view: ${url}`));
+    script.onerror = () => {
+      // Remove failed script so a retry is possible.
+      script.remove();
+      reject(new Error(`Failed to load spec view: ${url}`));
+    };
     document.head.appendChild(script);
   });
 }
@@ -221,12 +228,14 @@ export const OverviewDispatch: React.FunctionComponent<DispatchProps> = (
       for (const sv of settings.spec_views) {
         if (specNames.includes(sv.spec)) {
           return (
-            <DynamicSpecView
-              specName={sv.spec}
-              url={sv.url}
-              segments={props.segments}
-              item={props.item}
-            />
+            <ErrorBoundary>
+              <DynamicSpecView
+                specName={sv.spec}
+                url={sv.url}
+                segments={props.segments}
+                item={props.item}
+              />
+            </ErrorBoundary>
           );
         }
       }
