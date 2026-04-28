@@ -33,8 +33,8 @@ from tiled.utils import APACHE_ARROW_FILE_MIME_TYPE
 rng = np.random.default_rng(42)
 
 arrays = {
-    # "empty_1d": ragged.array([]),
-    # "empty_nd": ragged.array([[], [], []]),
+    # "empty_1d": ragged.array([]),      # awkward.to_parquet raises on `0 * unknown` type
+    # "empty_nd": ragged.array([[], [], []]),  # round-trips with unknown element type, not float64
     "numpy_1d": ragged.array(rng.random(10)),
     "numpy_2d": ragged.array(rng.random((3, 5))),
     "numpy_3d": ragged.array(rng.random((2, 3, 4))),
