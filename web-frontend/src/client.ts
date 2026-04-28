@@ -1,71 +1,50 @@
-import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
+import axios from "axios";
 import { components } from "./openapi_schemas";
-import {
-  getStoredAccessToken,
-  getStoredRefreshToken,
-  storeTokens,
-  clearTokens,
-} from "./context/auth";
 
-const axiosInstance = axios.create();
+export const axiosInstance = axios.create();
 
-// Attach Bearer token to every request.
-axiosInstance.interceptors.request.use((config: InternalAxiosRequestConfig) => {
-  const token = getStoredAccessToken();
-  if (token) {
-    config.headers.set("Authorization", `Bearer ${token}`);
+// Transform absolute URLs in "links" fields to relative paths so the UI
+// works regardless of the origin the server reports.
+function toRelativePath(urlString: string): string {
+  try {
+    const url = new URL(urlString);
+    return url.pathname + url.search + url.hash;
+  } catch {
+    return urlString;
   }
-  return config;
-});
+}
 
-// On 401, attempt a token refresh; retry the original request on success.
-let refreshPromise: Promise<boolean> | null = null;
+function transformLinks(data: any): any {
+  if (typeof data === "object" && data !== null) {
+    const transformed: any = Array.isArray(data) ? [] : {};
+    for (const key in data) {
+      if (key === "links" && typeof data[key] === "object") {
+        transformed[key] = {};
+        for (const linkKey in data[key]) {
+          const linkValue = data[key][linkKey];
+          transformed[key][linkKey] =
+            typeof linkValue === "string"
+              ? toRelativePath(linkValue)
+              : linkValue;
+        }
+      } else {
+        transformed[key] = transformLinks(data[key]);
+      }
+    }
+    return transformed;
+  }
+  return data;
+}
 
 axiosInstance.interceptors.response.use(
-  (response) => response,
-  async (error: AxiosError) => {
-    const originalRequest = error.config as InternalAxiosRequestConfig & {
-      _retry?: boolean;
-    };
-    if (
-      error.response?.status === 401 &&
-      originalRequest &&
-      !originalRequest._retry
-    ) {
-      originalRequest._retry = true;
-      const refreshToken = getStoredRefreshToken();
-      if (refreshToken) {
-        if (!refreshPromise) {
-          refreshPromise = (async () => {
-            try {
-              const resp = await axios.post("/api/v1/auth/session/refresh", {
-                refresh_token: refreshToken,
-              });
-              storeTokens(resp.data.access_token, resp.data.refresh_token);
-              return true;
-            } catch {
-              clearTokens();
-              return false;
-            }
-          })().finally(() => {
-            refreshPromise = null;
-          });
-        }
-        const success = await refreshPromise;
-        if (success) {
-          const token = getStoredAccessToken();
-          if (token) {
-            originalRequest.headers.set("Authorization", `Bearer ${token}`);
-          }
-          return axiosInstance(originalRequest);
-        }
-        // Had a session but refresh failed — reload to reach login page.
-        window.location.reload();
-      }
-      // No refresh token — not logged in. Just let the 401 propagate.
+  (response) => {
+    if (response.config.responseType === "blob") {
+      return response;
     }
-    return Promise.reject(error);
+    response.data = transformLinks(response.data);
+    return response;
   },
+  (error) => Promise.reject(error),
 );
 
 export const search = async (
@@ -73,7 +52,7 @@ export const search = async (
   segments: string[],
   signal: AbortSignal,
   fields: string[] = [],
-  selectMetadata: any = null,
+  selectMetadata: string | null = null,
   pageOffset: number = 0,
   pageLimit: number = 100,
   sort: string | null = null,
@@ -116,5 +95,3 @@ export const about = async (): Promise<components["schemas"]["About"]> => {
   const response = await axiosInstance.get("/api/v1/");
   return response.data;
 };
-
-export { axiosInstance };

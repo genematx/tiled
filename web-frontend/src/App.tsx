@@ -6,7 +6,8 @@ import React, { useEffect, useState } from "react";
 import * as ReactDOM from "react-dom";
 import { fetchSettings } from "./settings";
 import { SettingsContext, emptySettings } from "./context/settings";
-import { AuthProvider, useAuth } from "./context/auth";
+import { AuthProvider } from "./auth/auth-provider";
+import { useAuth } from "./auth/auth-context";
 import { about } from "./client";
 import { components } from "./openapi_schemas";
 import { Suspense, lazy } from "react";
@@ -76,6 +77,10 @@ function App() {
             <Suspense fallback={<Skeleton variant="rectangular" />}>
               <Routes>
                 <Route path="/" element={<MainContainer />}>
+                  <Route
+                    index
+                    element={<Navigate to="/browse/" replace />}
+                  />
                   <Route
                     path="/browse/*"
                     element={

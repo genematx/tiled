@@ -8,7 +8,8 @@ import { Link, useNavigate } from "react-router-dom";
 import Toolbar from "@mui/material/Toolbar";
 import Typography from "@mui/material/Typography";
 import Box from "@mui/material/Box";
-import { useAuth, getStoredRefreshToken } from "../../context/auth";
+import { useAuth } from "../../auth/auth-context";
+import { tokenManager } from "../../auth/token-manager";
 import { axiosInstance } from "../../client";
 
 const TiledAppBar = () => {
@@ -18,7 +19,7 @@ const TiledAppBar = () => {
 
   const handleLogout = async () => {
     setAnchorEl(null);
-    const refreshToken = getStoredRefreshToken();
+    const refreshToken = tokenManager.getRefreshToken();
     if (refreshToken) {
       try {
         await axiosInstance.post("/api/v1/auth/session/revoke", {

@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { useAuth } from "../context/auth";
+import { useAuth } from "../auth/auth-context";
 import { useNavigate, Navigate } from "react-router-dom";
 import { axiosInstance } from "../client";
 import Box from "@mui/material/Box";
