@@ -236,7 +236,8 @@ class RaggedClient(BaseClient):
     @property
     def nbytes(self) -> int:
         """The size of the array in bytes."""
-        return self.size * self.dtype.itemsize
+        structure = cast("RaggedStructure", self.structure())
+        return structure.nbytes
 
     @property
     def partitions(self) -> tuple[int, ...]:
