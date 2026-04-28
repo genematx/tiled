@@ -66,6 +66,12 @@ class SimpleTiledServer:
     readable_storage : Optional[Union[str, pathlib.Path, list[Union[str, pathlib.Path]]]
         If provided, the server will be able to read from these storage locations, in addition
         to the default storage location defined by `directory`.
+    enable_webhooks : bool
+        If True, mount the webhooks API and start the webhook dispatcher.
+        HTTP targets and local addresses are accepted (no HTTPS or SSRF
+        checks), making it easy to test against a local receiver.
+        A ``webhook_secret_key`` is auto-generated and exposed as an
+        attribute.  Default is False.
 
     Examples
     --------
@@ -94,12 +100,14 @@ class SimpleTiledServer:
         readable_storage: Optional[
             Union[str, pathlib.Path, list[Union[str, pathlib.Path]]]
         ] = None,
+        enable_webhooks: bool = False,
     ):
         # Delay import to avoid circular import.
         from ..catalog import from_uri as catalog_from_uri
-        from ..config import Authentication, StreamingCacheConfig
+        from ..config import Authentication, StreamingCacheConfig, WebhooksConfig
         from .app import build_app
         from .logging_config import LOGGING_CONFIG
+        from .webhook_router import _noop_url_validator
 
         if directory is None:
             directory = pathlib.Path(tempfile.mkdtemp())
@@ -115,6 +123,11 @@ class SimpleTiledServer:
         # and is not intended for production use, so we think this is an
         # acceptable concession to usability.
         api_key = api_key or secrets.token_hex(8)
+
+        # If webhooks are enabled, generate a secret key for encrypting HMAC
+        # signing secrets at rest.  Use a full 32-byte key here since it is
+        # stored on disk and not typed by humans.
+        webhook_secret_key = secrets.token_hex(32) if enable_webhooks else None
 
         # Alter copy of default LOGGING_CONFIG to log to files instead of
         # stdout and stderr.
@@ -142,8 +155,15 @@ class SimpleTiledServer:
             readable_storage=readable_storage,
             cache_config=StreamingCacheConfig(uri="memory").model_dump(),
         )
+        server_settings = {}
+        if enable_webhooks:
+            webhook_cfg = WebhooksConfig(secret_keys=[webhook_secret_key])
+            server_settings["webhooks"] = webhook_cfg
         self.app = build_app(
-            self.catalog, authentication=Authentication(single_user_api_key=api_key)
+            self.catalog,
+            authentication=Authentication(single_user_api_key=api_key),
+            server_settings=server_settings,
+            webhook_url_validator=_noop_url_validator if enable_webhooks else None,
         )
         self._server = ThreadedServer(
             uvicorn.Config(self.app, port=port, loop="asyncio", log_config=log_config)
@@ -194,6 +214,7 @@ class SimpleTiledServer:
         self.directory = directory
         self.storage = cast(SQLStorage, get_storage(storage_uri))
         self.api_key = api_key
+        self.webhook_secret_key = webhook_secret_key  # None if webhooks not enabled
         self.uri = f"{base_url}/api/v1?api_key={quote_plus(api_key)}"
         self.web_ui_link = f"{base_url}?api_key={quote_plus(api_key)}"
 
