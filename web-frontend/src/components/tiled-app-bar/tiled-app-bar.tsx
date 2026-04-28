@@ -51,7 +51,7 @@ const TiledAppBar = () => {
             }}
           >
             <img
-              src={`${import.meta.env.BASE_URL}tiled_logo.svg`}
+              src={`${import.meta.env.BASE_URL}tiled-logo.svg`}
               alt="Tiled logo"
               style={{ height: 28, marginRight: 8 }}
             />
