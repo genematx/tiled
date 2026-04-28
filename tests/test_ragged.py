@@ -27,6 +27,7 @@ from tiled.server.app import build_app
 from tiled.storage import SQLStorage, parse_storage, register_storage
 from tiled.structures.core import StructureFamily
 from tiled.structures.data_source import DataSource, Management
+from tiled.structures.ragged import make_ragged_array
 from tiled.structures.table import TableStructure
 from tiled.utils import APACHE_ARROW_FILE_MIME_TYPE
 
