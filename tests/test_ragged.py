@@ -111,7 +111,7 @@ def test_serialization_roundtrip(name):
 
 @pytest.mark.parametrize("name", arrays.keys())
 def test_slicing(module_client, name):
-    array = ragged.array(arrays[name])
+    array = make_ragged_array(arrays[name])
     rac = module_client[name]
 
     # Read the data back out from the RaggedClient, progressively sliced.
