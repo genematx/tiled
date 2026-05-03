@@ -2,6 +2,7 @@
 Adapted from https://raw.githubusercontent.com/obendidi/httpx-cache/main/httpx_cache/transport.py
 in accordance with its BSD-3 license
 """
+
 import logging
 import typing as tp
 from datetime import datetime, timedelta, timezone
@@ -92,12 +93,13 @@ class ByteStreamWrapper(httpx.ByteStream):
     async def __aiter__(self) -> tp.AsyncIterator[bytes]:
         """Iterate over the async stream object and store it's chunks in a content.
 
-        After the stream is completed call the async callback with content as argument.
+        After the stream is completed call the callback with content as argument.
+        The callback is synchronous (cache.set is backed by SQLite).
         """
         async for chunk in self.stream:
             self.content.extend(chunk)
             yield chunk
-        await self.callback(bytes(self.content))
+        self.callback(bytes(self.content))
 
 
 class CacheControl:
