@@ -109,6 +109,7 @@ if modules_available("openpyxl", "pandas"):
         lambda mimetype, buffer: pandas.read_excel(buffer),
     )
     mimetypes.types_map.setdefault(".xlsx", XLSX_MIME_TYPE)
+
 if modules_available("orjson"):
     import orjson
 
@@ -119,6 +120,9 @@ if modules_available("orjson"):
         int32, ...), pandas NA, and pandas NaT. Convert all of these to their
         Python-native equivalents, with missing values becoming None.
         """
+
+        import numpy
+
         arr = series.to_numpy(dtype=object, na_value=None)
 
         def to_native(v):
