@@ -78,11 +78,13 @@ function DynamicSpecView({
   url,
   segments,
   item,
+  config,
 }: {
   specName: string;
   url: string;
   segments: string[];
   item: any;
+  config: Record<string, any>;
 }) {
   const [Component, setComponent] = useState<React.ComponentType<any> | null>(
     null,
@@ -114,7 +116,7 @@ function DynamicSpecView({
 
   if (error) return <div>Error loading spec view: {error}</div>;
   if (!Component) return <Skeleton variant="rectangular" />;
-  return <Component segments={segments} item={item} />;
+  return <Component segments={segments} item={item} config={config} />;
 }
 
 interface TabPanelProps {
@@ -234,6 +236,7 @@ export const OverviewDispatch: React.FunctionComponent<DispatchProps> = (
                 url={sv.url}
                 segments={props.segments}
                 item={props.item}
+                config={sv}
               />
             </ErrorBoundary>
           );

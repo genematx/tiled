@@ -20,6 +20,7 @@ interface Spec {
 interface SpecView {
   spec: string;
   url: string;
+  [key: string]: any; // allow arbitrary config fields (e.g. chat_url, model_name)
 }
 
 interface Settings {
