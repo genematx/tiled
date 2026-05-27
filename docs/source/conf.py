@@ -48,7 +48,7 @@ extensions = [
     "IPython.sphinxext.ipython_console_highlighting",
     "matplotlib.sphinxext.plot_directive",
     "numpydoc",
-    "sphinx_click",
+    "sphinxcontrib.typer",  # Use sphinxcontrib-typer instead of sphinx-click for Typer CLI
     "sphinx_copybutton",
     "sphinx_external_toc",
     "myst_nb",

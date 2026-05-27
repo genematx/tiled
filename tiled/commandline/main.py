@@ -167,6 +167,3 @@ main = cli_app
 
 if __name__ == "__main__":
     main()
-
-# This object is used by the auto-generated documentation.
-typer_click_object = typer.main.get_command(cli_app)

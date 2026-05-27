@@ -5,7 +5,7 @@ Use ``tiled --help`` for info, or see the documentation below.
 
 
 ```{eval-rst}
-.. click:: tiled.commandline.main:typer_click_object
+.. typer:: tiled.commandline.main:cli_app
    :prog: tiled
-   :nested: full
+   :preferred: text
 ```
