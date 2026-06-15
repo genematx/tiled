@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ..structures.core import StructureFamily
 from .container import LENGTH_CACHE_TTL, Container
-from .utils import MSGPACK_MIME_TYPE, handle_error, retry_context
+from .utils import MSGPACK_MIME_TYPE, handle_error
 
 if TYPE_CHECKING:
     import pyarrow
@@ -19,24 +19,22 @@ class CompositeClient(Container):
         while (next_page_url is not None) or (
             maxlen is not None and len(result) < maxlen
         ):
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={
-                                **parse_qs(urlparse(next_page_url).query),
-                                **self._queries_as_params,
-                            }
-                            | ({} if include_metadata else {"select_metadata": False})
-                            | (
-                                {}
-                                if not self._include_data_sources
-                                else {"include_data_sources": True}
-                            ),
-                        )
-                    ).json()
+            content = handle_error(
+                self.context.http_client.get(
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={
+                        **parse_qs(urlparse(next_page_url).query),
+                        **self._queries_as_params,
+                    }
+                    | ({} if include_metadata else {"select_metadata": False})
+                    | (
+                        {}
+                        if not self._include_data_sources
+                        else {"include_data_sources": True}
+                    ),
+                )
+            ).json()
             result.update({item["id"]: item for item in content["data"]})
 
             next_page_url = content["links"]["next"]

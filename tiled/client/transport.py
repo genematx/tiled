@@ -3,13 +3,14 @@ Adapted from https://raw.githubusercontent.com/obendidi/httpx-cache/main/httpx_c
 in accordance with its BSD-3 license
 """
 import typing as tp
+import weakref
 
 import httpx
 
 from .cache import Cache
 from .cache_control import ByteStreamWrapper, CacheControl
 from .logger import collect_request, collect_response, log_request, log_response, logger
-from .utils import TiledResponse
+from .utils import TiledResponse, retry_context
 
 
 class Transport(httpx.BaseTransport):
@@ -153,6 +154,84 @@ class Transport(httpx.BaseTransport):
         if __debug__:
             collect_response(response)
         return response
+
+
+class RetryingTransport(httpx.BaseTransport):
+    """Outermost transport that runs every request through tiled's retry loop.
+
+    Centralises retry / cancel / circuit-breaker / spinner behaviour.  With
+    this transport installed on a Context's ``http_client``, individual call
+    sites do not need ``for attempt in retry_context(...)`` wrappers — every
+    HTTP request automatically:
+
+      * blocks on :meth:`Context.wait_for_circuit` if a peer worker is
+        currently retrying (no piling onto a struggling server);
+      * honours :attr:`Context.cancel_event` for cross-thread cancellation
+        (Ctrl-C in the main thread aborts retries on dask worker threads);
+      * shows / hides the shared retry indicator through ``Context``'s
+        refcount machinery;
+      * is retried by stamina on transient ``httpx`` errors and on
+        retriable status codes (5xx, 429).
+
+    Holds a ``weakref`` to its owning Context so the transport does not
+    prevent garbage collection.  If the Context is GC'd, the transport
+    degenerates to a thin pass-through with no retries — safe but unusual.
+
+    Streaming responses are not supported by this transport (tiled itself
+    does not use ``http_client.stream`` on data fetches).  A streaming
+    request still works, but if the underlying transport returns a 5xx the
+    body is read into memory before raising — acceptable because tiled does
+    not issue streaming requests on hot paths.
+    """
+
+    def __init__(self, inner: httpx.BaseTransport, context_ref: "weakref.ref"):
+        self._inner = inner
+        self._context_ref = context_ref
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        ctx = self._context_ref()
+        if ctx is None:
+            # Owning Context has been garbage-collected; behave as a
+            # plain pass-through.  This should not happen during normal
+            # use because the Context owns the http_client which owns us.
+            return self._inner.handle_request(request)
+        # Gate on the circuit breaker before issuing the request so that
+        # when one worker is in the middle of a retry storm, peers do not
+        # add more load.
+        ctx.wait_for_circuit()
+        if ctx.cancel_event.is_set():
+            # Cancellation was requested while we were waiting (e.g. user
+            # hit Ctrl-C in the main thread).  Abort without issuing the
+            # request so the calling worker exits its compute loop.
+            raise httpx.RequestError(
+                "Tiled Context has been cancelled; request aborted.",
+                request=request,
+            )
+        for attempt in retry_context(ctx):
+            with attempt:
+                response = self._inner.handle_request(request)
+                # Convert retriable status codes to exceptions so stamina
+                # retries them via the configured ``should_retry`` rule.
+                # Non-retriable statuses (1xx / 3xx / 4xx) are returned
+                # unchanged for the caller's ``handle_error`` to render.
+                if response.status_code == 429 or response.status_code >= 500:
+                    # Drain the body so the underlying connection is
+                    # released back to the pool before retry sleep.  The
+                    # body is then available on the eventual final
+                    # exception's ``.response`` for error reporting.
+                    response.read()
+                    raise httpx.HTTPStatusError(
+                        f"{response.status_code} {response.reason_phrase}",
+                        request=request,
+                        response=response,
+                    )
+                return response
+        # Unreachable: retry_context either yields an attempt that returns
+        # above, or raises on exhaustion / non-retriable failure.
+        raise AssertionError("retry_context exited without yielding")  # pragma: no cover
 
 
 # For when we implement an Async client

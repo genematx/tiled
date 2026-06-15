@@ -36,7 +36,6 @@ from .utils import (
     export_util,
     handle_error,
     normalize_specs,
-    retry_context,
 )
 
 if TYPE_CHECKING:
@@ -195,20 +194,18 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                 # Used the cached value and do not make any request.
                 return length
         link = self.item["links"]["search"]
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    self.context.http_client.get(
-                        link,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        params={
-                            **parse_qs(urlparse(link).query),
-                            "fields": "count",
-                            **self._queries_as_params,
-                            **self._sorting_params,
-                        },
-                    )
-                ).json()
+        content = handle_error(
+            self.context.http_client.get(
+                link,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                params={
+                    **parse_qs(urlparse(link).query),
+                    "fields": "count",
+                    **self._queries_as_params,
+                    **self._sorting_params,
+                },
+            )
+        ).json()
         length = content["meta"]["count"]
         self._cached_len = (length, now + LENGTH_CACHE_TTL)
         return length
@@ -232,20 +229,18 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             return (yield from contents)
         next_page_url = self.item["links"]["search"]
         while next_page_url is not None:
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={
-                                **parse_qs(urlparse(next_page_url).query),
-                                "fields": "",
-                                **self._queries_as_params,
-                                **self._sorting_params,
-                            },
-                        )
-                    ).json()
+            content = handle_error(
+                self.context.http_client.get(
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={
+                        **parse_qs(urlparse(next_page_url).query),
+                        "fields": "",
+                        **self._queries_as_params,
+                        **self._sorting_params,
+                    },
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -289,15 +284,13 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             if self._include_data_sources:
                 params["include_data_sources"] = True
             link = self.item["links"]["search"]
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            link,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={**parse_qs(urlparse(link).query), **params},
-                        )
-                    ).json()
+            content = handle_error(
+                self.context.http_client.get(
+                    link,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={**parse_qs(urlparse(link).query), **params},
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -355,18 +348,16 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
                         if self._include_data_sources:
                             params["include_data_sources"] = True
                         link = self_link + "".join(f"/{key}" for key in keys[i:])
-                        for attempt in retry_context():
-                            with attempt:
-                                content = handle_error(
-                                    self.context.http_client.get(
-                                        link,
-                                        headers={"Accept": MSGPACK_MIME_TYPE},
-                                        params={
-                                            **parse_qs(urlparse(link).query),
-                                            **params,
-                                        },
-                                    )
-                                ).json()
+                        content = handle_error(
+                            self.context.http_client.get(
+                                link,
+                                headers={"Accept": MSGPACK_MIME_TYPE},
+                                params={
+                                    **parse_qs(urlparse(link).query),
+                                    **params,
+                                },
+                            )
+                        ).json()
                     except ClientError as err:
                         if err.response.status_code == httpx.codes.NOT_FOUND:
                             # If this is a scalar lookup, raise KeyError("X") not KeyError(("X",)).
@@ -411,17 +402,15 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             keys = self.keys()
         keys = [keys] if isinstance(keys, str) else keys
         for key in set(keys):
-            for attempt in retry_context():
-                with attempt:
-                    handle_error(
-                        self.context.http_client.delete(
-                            f"{self.uri}/{key}",
-                            params={
-                                "recursive": recursive,
-                                "external_only": external_only,
-                            },
-                        )
-                    )
+            handle_error(
+                self.context.http_client.delete(
+                    f"{self.uri}/{key}",
+                    params={
+                        "recursive": recursive,
+                        "external_only": external_only,
+                    },
+                )
+            )
 
         return self
 
@@ -455,20 +444,18 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             next_page_url += f"&page[limit]={page_size}"
         item_counter = itertools.count(start)
         while next_page_url is not None:
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params={
-                                **parse_qs(urlparse(next_page_url).query),
-                                "fields": "",
-                                **self._queries_as_params,
-                                **sorting_params,
-                            },
-                        )
-                    ).json()
+            content = handle_error(
+                self.context.http_client.get(
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params={
+                        **parse_qs(urlparse(next_page_url).query),
+                        "fields": "",
+                        **self._queries_as_params,
+                        **sorting_params,
+                    },
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -521,15 +508,13 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             }
             if self._include_data_sources:
                 params["include_data_sources"] = True
-            for attempt in retry_context():
-                with attempt:
-                    content = handle_error(
-                        self.context.http_client.get(
-                            next_page_url,
-                            headers={"Accept": MSGPACK_MIME_TYPE},
-                            params=params,
-                        )
-                    ).json()
+            content = handle_error(
+                self.context.http_client.get(
+                    next_page_url,
+                    headers={"Accept": MSGPACK_MIME_TYPE},
+                    params=params,
+                )
+            ).json()
             self._cached_len = (
                 content["meta"]["count"],
                 time.monotonic() + LENGTH_CACHE_TTL,
@@ -587,22 +572,20 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
 
         link = self.item["links"]["self"].replace("/metadata", "/distinct", 1)
-        for attempt in retry_context():
-            with attempt:
-                distinct = handle_error(
-                    self.context.http_client.get(
-                        link,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        params={
-                            **parse_qs(urlparse(link).query),
-                            "metadata": metadata_keys,
-                            "structure_families": structure_families,
-                            "specs": specs,
-                            "counts": counts,
-                            **self._queries_as_params,
-                        },
-                    )
-                ).json()
+        distinct = handle_error(
+            self.context.http_client.get(
+                link,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                params={
+                    **parse_qs(urlparse(link).query),
+                    "metadata": metadata_keys,
+                    "structure_families": structure_families,
+                    "specs": specs,
+                    "counts": counts,
+                    **self._queries_as_params,
+                },
+            )
+        ).json()
         return distinct
 
     def sort(self, *sorting):
@@ -734,18 +717,16 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         else:
             endpoint = self.uri
 
-        for attempt in retry_context():
-            with attempt:
-                document = handle_error(
-                    self.context.http_client.post(
-                        endpoint,
-                        headers={
-                            "Accept": MSGPACK_MIME_TYPE,
-                            "Content-Type": "application/json",
-                        },
-                        content=safe_json_dump(body),
-                    )
-                ).json()
+        document = handle_error(
+            self.context.http_client.post(
+                endpoint,
+                headers={
+                    "Accept": MSGPACK_MIME_TYPE,
+                    "Content-Type": "application/json",
+                },
+                content=safe_json_dump(body),
+            )
+        ).json()
 
         if structure_family == StructureFamily.container:
             structure = {"contents": None, "count": None}

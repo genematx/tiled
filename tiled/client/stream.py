@@ -43,7 +43,6 @@ from .utils import (
     client_for_item,
     handle_error,
     normalize_specs,
-    retry_context,
 )
 
 T = TypeVar("T")
@@ -753,14 +752,12 @@ class LiveArrayRef(ArrayRef):
         "Fetch array"
         import numpy
 
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    self.subscription.context.http_client.get(
-                        self.uri,
-                        headers={"Accept": "application/octet-stream"},
-                    )
-                ).read()
+        content = handle_error(
+            self.subscription.context.http_client.get(
+                self.uri,
+                headers={"Accept": "application/octet-stream"},
+            )
+        ).read()
         # Decode payload (bytes) into array.
         numpy_dtype = self.data_type.to_numpy_dtype()
         if self.patch:

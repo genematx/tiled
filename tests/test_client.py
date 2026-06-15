@@ -183,18 +183,21 @@ def test_jump_down_tree():
 def test_no_stamina_retry_scheduled_messages(caplog):
     """stamina's default 'stamina.retry_scheduled' WARNING must never appear.
 
-    Tiled removes the default stamina hook so that no global retry noise is emitted,
-    regardless of show_logs()/hide_logs() state.
+    Tiled strips the default stamina hook on first use of its retry path,
+    so no global retry noise is emitted regardless of show_logs() /
+    hide_logs() state.
     """
+    from tiled.client.utils import retry_context
+
     stamina.set_active(True)
     try:
         n = 0
         with caplog.at_level(logging.DEBUG, logger="stamina"):
-            for attempt in stamina.retry_context(on=Exception, attempts=2, timeout=10):
+            for attempt in retry_context():
                 with attempt:
                     n += 1
                     if n < 2:
-                        raise ValueError("transient error")
+                        raise httpx.ConnectError("transient error")
 
         stamina_messages = [r for r in caplog.records if r.name == "stamina"]
         assert (
@@ -315,36 +318,35 @@ def test_semaphore_limits_concurrent_partition_fetches():
 # --- Progress bar tests ---
 
 
-def test_tracking_progress_sets_and_clears_state():
-    """tracking_progress sets _progress_state during the context and clears it after."""
+@pytest.mark.parametrize(
+    "show_progress, total, expect_state",
+    [
+        (True, 5, True),  # normal: state allocated
+        (False, 10, False),  # show_progress=False → no-op
+        (True, 1, False),  # total<=1 → no-op even with show_progress
+    ],
+    ids=["active", "show_progress_false", "total<=1"],
+)
+def test_tracking_progress_state_lifecycle(show_progress, total, expect_state):
+    """tracking_progress sets _progress_state during the context (if and
+    only if a bar is actually rendered) and clears it on exit."""
     from unittest.mock import patch
 
     tree = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
     app = build_app(tree)
 
-    with Context.from_app(app, show_progress=True) as context:
+    with Context.from_app(app, show_progress=show_progress) as context:
         with patch("tiled.client.utils.is_interactive", return_value=True):
-            with context.tracking_progress(total=5):
-                assert context.progress_state is not None
-                state = context.progress_state
-                assert state._task_id is not None
-
-        # After exit, state is cleared
+            with context.tracking_progress(total=total):
+                if expect_state:
+                    assert context.progress_state is not None
+                else:
+                    assert context.progress_state is None
         assert context.progress_state is None
 
 
-def test_tracking_progress_noop_when_show_progress_false():
-    """tracking_progress is a no-op when show_progress is False."""
-    tree = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
-    app = build_app(tree)
-
-    with Context.from_app(app, show_progress=False) as context:
-        with context.tracking_progress(total=10):
-            assert context.progress_state is None
-
-
-def test_tracking_progress_nesting_is_noop():
-    """Inner tracking_progress defers to outer (no nested bars)."""
+def test_tracking_progress_nesting_defers_to_outer():
+    """Nested tracking_progress reuses the outer state — no nested bars."""
     from unittest.mock import patch
 
     tree = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
@@ -353,55 +355,38 @@ def test_tracking_progress_nesting_is_noop():
     with Context.from_app(app, show_progress=True) as context:
         with patch("tiled.client.utils.is_interactive", return_value=True):
             with context.tracking_progress(total=10):
-                outer_state = context.progress_state
-                assert outer_state is not None
-
-                # Inner tracking_progress should NOT overwrite
+                outer = context.progress_state
+                assert outer is not None
                 with context.tracking_progress(total=5):
-                    assert context.progress_state is outer_state
-
-            # After outer exits, state is cleared
+                    assert context.progress_state is outer
             assert context.progress_state is None
 
 
-def test_show_progress_from_env_var(monkeypatch):
-    """TILED_SHOW_PROGRESS env var controls context.show_progress."""
+@pytest.mark.parametrize(
+    "env_value, explicit, expected",
+    [
+        (None, None, True),  # default: env unset, no explicit → True
+        ("1", None, True),
+        ("0", None, False),
+        ("false", None, False),
+        ("no", None, False),
+        ("0", True, True),  # explicit overrides env
+        ("1", False, False),
+    ],
+)
+def test_show_progress_resolution(monkeypatch, env_value, explicit, expected):
+    """show_progress is set from the explicit kwarg if given, else from
+    TILED_SHOW_PROGRESS, else defaults to True.  Recognised falsy values are
+    "0", "false", "no" (case-insensitive)."""
     tree_local = MapAdapter({})
     app = build_app(tree_local)
-
-    # Default (no env var) is True
-    monkeypatch.delenv("TILED_SHOW_PROGRESS", raising=False)
-    with Context.from_app(app) as context:
-        assert context.show_progress is True
-
-    monkeypatch.setenv("TILED_SHOW_PROGRESS", "1")
-    with Context.from_app(app) as context:
-        assert context.show_progress is True
-
-    monkeypatch.setenv("TILED_SHOW_PROGRESS", "0")
-    with Context.from_app(app) as context:
-        assert context.show_progress is False
-
-    monkeypatch.setenv("TILED_SHOW_PROGRESS", "false")
-    with Context.from_app(app) as context:
-        assert context.show_progress is False
-
-    monkeypatch.setenv("TILED_SHOW_PROGRESS", "no")
-    with Context.from_app(app) as context:
-        assert context.show_progress is False
-
-
-def test_show_progress_explicit_overrides_env(monkeypatch):
-    """Explicit show_progress=True/False overrides the env var."""
-    monkeypatch.setenv("TILED_SHOW_PROGRESS", "0")
-    tree_local = MapAdapter({})
-    app = build_app(tree_local)
-    with Context.from_app(app, show_progress=True) as context:
-        assert context.show_progress is True
-
-    monkeypatch.setenv("TILED_SHOW_PROGRESS", "1")
-    with Context.from_app(app, show_progress=False) as context:
-        assert context.show_progress is False
+    if env_value is None:
+        monkeypatch.delenv("TILED_SHOW_PROGRESS", raising=False)
+    else:
+        monkeypatch.setenv("TILED_SHOW_PROGRESS", env_value)
+    kwargs = {} if explicit is None else {"show_progress": explicit}
+    with Context.from_app(app, **kwargs) as context:
+        assert context.show_progress is expected
 
 
 # --- Retry indicator tests ---
@@ -493,7 +478,8 @@ def test_standalone_retry_indicator_show_hide():
 
 @pytest.mark.parametrize("show_progress", [True, False])
 def test_signal_retry_uses_standalone_indicator(show_progress):
-    """signal_retry creates a standalone indicator regardless of show_progress."""
+    """signal_retry creates a standalone indicator regardless of show_progress
+    when no progress bar is active."""
     import sys
     from io import StringIO
     from unittest.mock import patch
@@ -513,12 +499,14 @@ def test_signal_retry_uses_standalone_indicator(show_progress):
 
             context.signal_retry_resolved()
             assert context.retry_indicator is None
-    """retry_context() with no context still shows the standalone retry indicator."""
+
+
+def test_retry_context_without_context_shows_indicator():
+    """retry_context() with no Context still shows a standalone retry
+    indicator (used by from_any_uri before a Context exists)."""
     import sys
     from io import StringIO
     from unittest.mock import patch
-
-    import stamina
 
     from tiled.client.utils import retry_context
 
@@ -527,7 +515,7 @@ def test_signal_retry_uses_standalone_indicator(show_progress):
         try:
             stamina.set_active(True)
             call_count = 0
-            for attempt in retry_context():  # no context
+            for attempt in retry_context():
                 with attempt:
                     call_count += 1
                     if call_count < 3:
@@ -537,31 +525,66 @@ def test_signal_retry_uses_standalone_indicator(show_progress):
             stamina.set_active(False)
 
 
-def test_signal_retry_uses_progress_state_when_available():
-    """signal_retry calls show_retrying on _progress_state if set."""
+@pytest.mark.parametrize("with_progress_state", [True, False])
+def test_signal_retry_refcounted(with_progress_state):
+    """signal_retry / signal_retry_resolved keep the indicator visible until
+    the last of any number of concurrent retries resolves.  Verified for
+    both the progress-bar path and the standalone path.  Extra
+    signal_retry_resolved() calls are no-ops."""
     from unittest.mock import MagicMock
 
     tree = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
     app = build_app(tree)
 
     with Context.from_app(app, show_progress=True) as context:
-        mock_state = MagicMock()
-        context._progress_state = mock_state
+        mock_state = MagicMock() if with_progress_state else None
+        if mock_state is not None:
+            context._progress_state = mock_state
 
-        context.signal_retry()
-        mock_state.show_retrying.assert_called_once()
-
+        # Extra resolved with no active retry — no-op.
         context.signal_retry_resolved()
-        mock_state.hide_retrying.assert_called_once()
+        context.signal_retry_resolved()
 
-        context._progress_state = None
+        context.signal_retry()  # A: 0→1, shows
+        ind_after_A = context._retry_indicator
+        context.signal_retry()  # B: 1→2, no-op
+        if mock_state is None:
+            assert context._retry_indicator is ind_after_A
+            assert ind_after_A is not None and ind_after_A._showing is True
+        else:
+            assert mock_state.show_retrying.call_count == 1
+            assert mock_state.hide_retrying.call_count == 0
+
+        context.signal_retry_resolved()  # A done: 2→1, still showing
+        if mock_state is None:
+            assert (
+                context._retry_indicator is ind_after_A
+                and ind_after_A._showing is True
+            )
+        else:
+            assert mock_state.hide_retrying.call_count == 0
+
+        context.signal_retry_resolved()  # B done: 1→0, hide
+        if mock_state is None:
+            assert context._retry_indicator is None
+            assert ind_after_A._showing is False
+        else:
+            assert mock_state.hide_retrying.call_count == 1
+
+        # Extra resolved past zero — no-op, no crash.
+        context.signal_retry_resolved()
+
+        if mock_state is not None:
+            context._progress_state = None
 
 
-def test_retry_context_signals_retry_indicator():
-    """retry_context with a context signals the retry indicator on retry."""
-    from unittest.mock import patch
-
-    import stamina
+def test_retry_loop_balances_signal_calls():
+    """Each retry loop must call signal_retry exactly once (on the first
+    retry, so the user sees feedback during the wait) and
+    signal_retry_resolved exactly once (on loop exit).  Otherwise the
+    indicator refcount leaks and the spinner stays visible after success.
+    """
+    from unittest.mock import MagicMock
 
     from tiled.client.utils import retry_context
 
@@ -569,128 +592,121 @@ def test_retry_context_signals_retry_indicator():
     app = build_app(tree)
 
     with Context.from_app(app, show_progress=True) as context:
-        with patch.object(context, "signal_retry") as mock_signal:
-            try:
-                stamina.set_active(True)
-                call_count = 0
+        mock_state = MagicMock()
+        context._progress_state = mock_state
+        try:
+            stamina.set_active(True)
+            n = 0
+            for attempt in retry_context(context):
+                with attempt:
+                    n += 1
+                    if n < 4:  # 3 retries scheduled
+                        raise httpx.ConnectError("transient")
+        finally:
+            stamina.set_active(False)
+            context._progress_state = None
 
-                for attempt in retry_context(context):
-                    with attempt:
-                        call_count += 1
-                        if call_count < 3:
-                            raise httpx.ConnectError("test")
-                # signal_retry should have been called for attempts 2 and 3
-                # (retry scheduled after attempt 1 and 2 fail)
-                assert mock_signal.call_count == 2
-            finally:
-                stamina.set_active(False)
+        assert n == 4
+        assert mock_state.show_retrying.call_count == 1, (
+            f"signal_retry must fire exactly once per loop, "
+            f"got {mock_state.show_retrying.call_count}"
+        )
+        assert mock_state.hide_retrying.call_count == 1
+        assert context._retry_count == 0, (
+            f"refcount leaked: {context._retry_count} after a successful loop"
+        )
 
 
-# --- 429 Too Many Requests tests ---
-
-
-def test_keyboard_interrupt_cancels_retries():
-    """KeyboardInterrupt during inter-retry sleep propagates and cancels remaining retries."""
-    from unittest.mock import patch
-
-    import stamina
+def test_keyboard_interrupt_cancels_retries_and_cleans_up():
+    """KeyboardInterrupt during inter-retry sleep propagates immediately,
+    aborts further retries, and lets the indicator be cleaned up."""
+    from unittest.mock import MagicMock, patch
 
     from tiled.client.utils import retry_context
+
+    tree = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree)
 
     attempts_made = []
 
     def fake_sleep(_):
         raise KeyboardInterrupt("simulated Ctrl-C")
 
-    try:
-        stamina.set_active(True)
-        with patch("time.sleep", fake_sleep):
-            try:
-                for attempt in retry_context():
-                    with attempt:
-                        attempts_made.append(attempt.num)
-                        raise httpx.ConnectError("refused")
-            except KeyboardInterrupt:
-                pass  # expected
-            else:
-                raise AssertionError("KeyboardInterrupt was not raised")
-    finally:
-        stamina.set_active(False)
-
-    # Only 1 attempt made — Ctrl-C during the sleep before attempt 2
-    assert len(attempts_made) == 1, f"Expected 1 attempt, got {len(attempts_made)}"
-
-
-def test_keyboard_interrupt_cleans_up_retry_indicator():
-    """KeyboardInterrupt cancels retries and cleans up the retry indicator."""
-    from unittest.mock import MagicMock, patch
-
-    import stamina
-
-    from tiled.client.utils import retry_context
-
-    tree = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
-    app = build_app(tree)
-
     with Context.from_app(app, show_progress=True) as context:
         mock_state = MagicMock()
         context._progress_state = mock_state
 
-        def fake_sleep(_):
-            raise KeyboardInterrupt("simulated Ctrl-C")
-
         try:
             stamina.set_active(True)
             with patch("time.sleep", fake_sleep):
-                try:
+                with pytest.raises(KeyboardInterrupt):
                     for attempt in retry_context(context):
                         with attempt:
+                            attempts_made.append(attempt.num)
                             raise httpx.ConnectError("refused")
-                except KeyboardInterrupt:
-                    pass
         finally:
             stamina.set_active(False)
             context._progress_state = None
 
-        # hide_retrying should have been called on Ctrl-C
+        # Only one attempt — Ctrl-C during the sleep before attempt 2.
+        assert len(attempts_made) == 1, (
+            f"expected 1 attempt, got {len(attempts_made)}"
+        )
         mock_state.hide_retrying.assert_called()
 
 
 @pytest.mark.parametrize(
-    "status_code, headers, expected",
+    "exc_factory, expected",
     [
-        (429, {"Retry-After": "2.5"}, 2.5),  # 429 with header → Retry-After float
-        (429, {}, True),  # 429 without header → default backoff
-        (403, {}, False),  # other 4xx → do not retry
+        (
+            lambda: httpx.HTTPStatusError(
+                "error",
+                request=httpx.Request("GET", "http://example.com/test"),
+                response=httpx.Response(
+                    429,
+                    headers={"Retry-After": "2.5"},
+                    request=httpx.Request("GET", "http://example.com/test"),
+                ),
+            ),
+            2.5,
+        ),
+        (
+            lambda: httpx.HTTPStatusError(
+                "error",
+                request=httpx.Request("GET", "http://example.com/test"),
+                response=httpx.Response(
+                    429, request=httpx.Request("GET", "http://example.com/test")
+                ),
+            ),
+            True,
+        ),
+        (
+            lambda: httpx.HTTPStatusError(
+                "error",
+                request=httpx.Request("GET", "http://example.com/test"),
+                response=httpx.Response(
+                    403, request=httpx.Request("GET", "http://example.com/test")
+                ),
+            ),
+            False,
+        ),
+        (lambda: httpx.UnsupportedProtocol("'htps://'."), False),
+        (lambda: httpx.LocalProtocolError("Illegal header value"), False),
     ],
-    ids=["429-retry-after", "429-no-header", "403-no-retry"],
+    ids=[
+        "429-retry-after",
+        "429-no-header",
+        "403-no-retry",
+        "unsupported-protocol",
+        "local-protocol-error",
+    ],
 )
-def test_should_retry(status_code, headers, expected):
-    """should_retry returns Retry-After float, True, or False depending on the response."""
+def test_should_retry(exc_factory, expected):
+    """should_retry returns Retry-After float, True, or False depending on
+    the exception kind."""
     from tiled.client.utils import should_retry
 
-    request = httpx.Request("GET", "http://example.com/test")
-    response = httpx.Response(status_code, headers=headers, request=request)
-    exc = httpx.HTTPStatusError("error", request=request, response=response)
-    assert should_retry(exc) == expected
-
-
-def test_should_not_retry_unsupported_protocol():
-    """A bad URL scheme (e.g. 'htps://') must not trigger a retry loop."""
-    from tiled.client.utils import should_retry
-
-    exc = httpx.UnsupportedProtocol(
-        "Request URL has an unsupported protocol 'htps://'."
-    )
-    assert should_retry(exc) is False
-
-
-def test_should_not_retry_local_protocol_error():
-    """An invalid request (e.g. illegal header value) must not trigger a retry loop."""
-    from tiled.client.utils import should_retry
-
-    exc = httpx.LocalProtocolError("Illegal header value b'a\\r\\nInjected: 1'")
-    assert should_retry(exc) is False
+    assert should_retry(exc_factory()) == expected
 
 
 def test_handle_error_lets_429_propagate():
@@ -765,3 +781,590 @@ def test_429_retry_with_real_server():
         assert response.json() == {"status": "ok"}
     finally:
         stamina.set_active(False)
+
+
+# --- Multi-threaded retry indicator + cancellation tests ---
+#
+# These exercise the realistic dask worker scenario, where retry attempts run
+# on a non-main thread.
+
+
+def test_signal_retry_from_worker_thread_is_visible():
+    import sys
+    from io import StringIO
+    from unittest.mock import patch
+
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    with Context.from_app(app, show_progress=False) as context:
+        fake_stderr = StringIO()
+
+        def worker():
+            with patch.object(sys, "stderr", fake_stderr):
+                context.signal_retry()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "worker thread did not finish"
+
+        # The retry indicator should have been created AND marked as showing,
+        # and *something* (text or a Live spinner start) should have been emitted.
+        assert (
+            context.retry_indicator is not None
+        ), "signal_retry from a worker thread did not create an indicator"
+        assert (
+            context.retry_indicator._showing is True
+        ), "signal_retry from a worker thread did not mark indicator as showing"
+
+
+def test_small_fetch_worker_retry_is_visible():
+    """When tracking_progress is a no-op (total<=1, non-interactive), a
+    retry running in a dask worker thread must still produce visible
+    feedback via the standalone indicator, and signal_retry called from
+    that worker must drive show() to completion."""
+    from unittest.mock import patch
+
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    with Context.from_app(app, show_progress=True) as context:
+        with context.tracking_progress(total=1):
+            # tracking_progress(total=1) is a no-op; _progress_state stays None.
+            assert context.progress_state is None
+
+            shown = []
+            original_show = (
+                __import__(
+                    "tiled.client.utils", fromlist=["StandaloneRetryIndicator"]
+                ).StandaloneRetryIndicator.show
+            )
+
+            def tracking_show(self):
+                shown.append(threading.current_thread())
+                original_show(self)
+
+            attempts = []
+            errors = []
+
+            def worker():
+                try:
+                    stamina.set_active(True)
+                    for attempt in retry_context(context):
+                        with attempt:
+                            attempts.append(1)
+                            if len(attempts) < 3:
+                                raise httpx.ConnectError("simulated transient")
+                except Exception as e:
+                    errors.append(e)
+                finally:
+                    stamina.set_active(False)
+
+            with patch(
+                "tiled.client.utils.StandaloneRetryIndicator.show", tracking_show
+            ):
+                t = threading.Thread(target=worker)
+                t.start()
+                t.join(timeout=10.0)
+
+            assert not t.is_alive(), "worker did not finish"
+            assert not errors, f"worker raised: {errors}"
+            assert len(attempts) == 3, f"expected 3 attempts, got {len(attempts)}"
+            assert shown, "StandaloneRetryIndicator.show was not called from worker"
+            assert shown[0] is t, "show() ran on a different thread than the worker"
+
+
+def test_cancel_event_terminates_worker_retry_loop():
+    """A Ctrl-C must be able to terminate retries running in dask
+    worker threads.  SIGINT is delivered only to the main thread, so the
+    Context must expose a cancellation Event that worker retry loops check
+    before sleeping again.  Once set, a worker should exit the retry loop
+    promptly instead of running through TILED_RETRY_ATTEMPTS.
+    """
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    with Context.from_app(app) as context:
+        # The Context must expose a cancellation Event accessible to workers.
+        assert hasattr(
+            context, "cancel_event"
+        ), "Context must expose a cancel_event for worker-thread Ctrl-C handling"
+        assert isinstance(context.cancel_event, threading.Event)
+        assert not context.cancel_event.is_set()
+
+        attempts_made = []
+        worker_finished = threading.Event()
+        worker_exception = []
+
+        def worker():
+            try:
+                stamina.set_active(True)
+                for attempt in retry_context(context):
+                    with attempt:
+                        attempts_made.append(len(attempts_made) + 1)
+                        raise httpx.ConnectError("refused")
+            except Exception as e:
+                worker_exception.append(e)
+            finally:
+                stamina.set_active(False)
+                worker_finished.set()
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        # Let the worker make at least one attempt and enter stamina's sleep.
+        import time as _time
+
+        _time.sleep(0.5)
+        assert len(attempts_made) >= 1
+
+        # Simulate Ctrl-C cancellation from the main thread.
+        context.cancel_event.set()
+
+        # Worker should exit promptly — well before all 10 attempts complete.
+        assert worker_finished.wait(timeout=3.0), (
+            f"worker did not terminate after cancel_event set; "
+            f"attempts_made={attempts_made}"
+        )
+        # And it should not have run through all attempts.
+        from tiled.client.utils import TILED_RETRY_ATTEMPTS
+
+        assert len(attempts_made) < TILED_RETRY_ATTEMPTS, (
+            f"cancel_event did not abort worker retries: "
+            f"made {len(attempts_made)}/{TILED_RETRY_ATTEMPTS} attempts"
+        )
+
+
+def test_standalone_retry_indicator_show_reset_race_terminal():
+    """Race: reset() runs between live.start() and storing self._live.
+
+    Without protection, the Rich Live spinner would keep rendering forever
+    because reset() saw self._live == None and bailed out.  The indicator
+    must detect the racing reset after creation and tear down immediately.
+    """
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from tiled.client.utils import StandaloneRetryIndicator
+
+    indicator = StandaloneRetryIndicator()
+    mock_live = MagicMock()
+
+    # Simulate the race: reset() fires during live.start().
+    def racing_start():
+        indicator.reset()
+
+    mock_live.start.side_effect = racing_start
+
+    tty_stderr = MagicMock()
+    tty_stderr.isatty = lambda: True
+    with patch("rich.live.Live", return_value=mock_live), patch.object(
+        sys, "stderr", tty_stderr
+    ):
+        indicator.show()
+
+    # The Live spinner must have been stopped — otherwise it leaks and
+    # renders forever.
+    mock_live.stop.assert_called_once()
+    assert indicator._showing is False
+    assert indicator._live is None
+
+
+def test_standalone_retry_indicator_jupyter_creates_widget_synchronously():
+    """In Jupyter, StandaloneRetryIndicator.show() must create and display
+    the ipywidget directly from the calling thread.
+
+    Scheduling the create on the kernel IOLoop (e.g. via
+    ``IOLoop.add_callback``) silently breaks single-fetch retry feedback:
+    during synchronous cell execution the kernel IOLoop is blocked, so a
+    queued create callback only runs after the cell completes — by which
+    time the retry has either resolved or failed and the indicator is
+    useless.
+    """
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from tiled.client.utils import StandaloneRetryIndicator
+
+    fake_label = MagicMock()
+    fake_widgets = MagicMock()
+    fake_widgets.Label.return_value = fake_label
+    fake_ipython_display = MagicMock()
+
+    indicator = StandaloneRetryIndicator()
+
+    with patch.dict(
+        sys.modules,
+        {"ipywidgets": fake_widgets, "IPython.display": fake_ipython_display},
+    ), patch("tiled.client.utils.is_jupyter", return_value=True):
+        indicator.show()
+
+    # display() must have been called synchronously during show() — not
+    # deferred onto some queue that never runs.
+    fake_ipython_display.display.assert_called_once_with(fake_label)
+    assert indicator._showing is True
+    assert indicator._live is fake_label
+
+
+def test_circuit_breaker_blocks_new_fetches_while_any_worker_retries():
+    """When one worker is actively retrying (signal_retry has fired),
+    other workers calling ``wait_for_circuit()`` must block until the
+    retry resolves.  Workers already past ``wait_for_circuit()`` (i.e.
+    already in-flight) are NOT interrupted.
+    """
+    import time as _time
+
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    with Context.from_app(app) as context:
+        assert context._circuit_closed_event.is_set(), "circuit closed by default"
+
+        # Worker A enters a retry — opens the circuit.
+        context.signal_retry()
+        assert not context._circuit_closed_event.is_set()
+
+        # Worker B tries to start a new fetch; it must block.
+        unblocked_at = []
+
+        def peer():
+            context.wait_for_circuit(poll_interval=0.05)
+            unblocked_at.append(_time.monotonic())
+
+        t = threading.Thread(target=peer)
+        t.start()
+        _time.sleep(0.2)
+        assert t.is_alive(), "peer should still be blocked on circuit gate"
+
+        # Worker A's retry resolves — closes the circuit.
+        context.signal_retry_resolved()
+        assert context._circuit_closed_event.is_set()
+
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "peer did not unblock after retry resolved"
+        assert len(unblocked_at) == 1
+
+
+def test_circuit_breaker_releases_on_cancel():
+    """``request_cancel()`` must unblock workers waiting on the circuit
+    gate so a Ctrl-C doesn't leave dask workers parked forever.
+    """
+    import time as _time
+
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    with Context.from_app(app) as context:
+        context.signal_retry()  # open circuit
+        unblocked = threading.Event()
+
+        def peer():
+            context.wait_for_circuit(poll_interval=0.05)
+            unblocked.set()
+
+        t = threading.Thread(target=peer)
+        t.start()
+        _time.sleep(0.2)
+        assert not unblocked.is_set()
+
+        context.request_cancel()
+        assert unblocked.wait(timeout=2.0), (
+            "request_cancel did not release workers blocked on circuit gate"
+        )
+
+        # Cleanup: balance the signal_retry so the next test starts clean.
+        context.reset_cancel()
+        context.signal_retry_resolved()
+
+
+def test_retry_exhaustion_aborts_peer_retry_loops():
+    """When one worker exhausts retries (or hits a non-retriable error),
+    ``retry_context`` must set the Context's ``cancel_event`` so peer
+    workers stuck in their own retry loops bail out promptly instead of
+    each running through their own full attempt budget.
+    """
+    import tiled.client.utils as cu
+
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    orig_attempts = cu.TILED_RETRY_ATTEMPTS
+    orig_timeout = cu.TILED_RETRY_TIMEOUT
+    cu.TILED_RETRY_ATTEMPTS = 3
+    cu.TILED_RETRY_TIMEOUT = 1.0
+
+    try:
+        with Context.from_app(app) as context:
+            stamina.set_active(True)
+            try:
+                # Failing worker — runs to exhaustion synchronously.
+                with pytest.raises(httpx.ConnectError):
+                    for attempt in retry_context(context):
+                        with attempt:
+                            raise httpx.ConnectError("permanent")
+
+                # Peer worker's cancel_event must be set now.
+                assert context.cancel_event.is_set(), (
+                    "exhausted retry_context did not request_cancel; peers "
+                    "would each run through their own attempt budget"
+                )
+            finally:
+                stamina.set_active(False)
+    finally:
+        cu.TILED_RETRY_ATTEMPTS = orig_attempts
+        cu.TILED_RETRY_TIMEOUT = orig_timeout
+
+
+def test_stale_cancel_event_does_not_starve_fresh_fetch_of_retries():
+    """A prior failed fetch leaves ``cancel_event`` set.  A subsequent
+    user-initiated single-fetch (no ``tracking_progress`` wrapper) must
+    still get its full retry budget — the stale flag must be cleared
+    before the new retry loop begins.
+    """
+    import tiled.client.utils as cu
+
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    orig_attempts = cu.TILED_RETRY_ATTEMPTS
+    orig_timeout = cu.TILED_RETRY_TIMEOUT
+    cu.TILED_RETRY_ATTEMPTS = 3
+    cu.TILED_RETRY_TIMEOUT = 1.0
+
+    try:
+        with Context.from_app(app) as context:
+            stamina.set_active(True)
+            try:
+                # Step 1: exhaust a retry loop to leave cancel_event set
+                # (the documented post-exhaustion behaviour).
+                with pytest.raises(httpx.ConnectError):
+                    for attempt in retry_context(context):
+                        with attempt:
+                            raise httpx.ConnectError("permanent")
+                assert context.cancel_event.is_set()
+                assert context._retry_count == 0
+
+                # Step 2: a single-fetch entry point calls wait_for_circuit
+                # (mirroring array._get_block / dataframe._get_partition).
+                # It must clear the stale flag so the new retry loop sees
+                # a fresh cancel state.
+                context.wait_for_circuit(poll_interval=0.05)
+                assert not context.cancel_event.is_set(), (
+                    "wait_for_circuit did not clear stale cancel_event; "
+                    "the next fetch will get zero retries"
+                )
+
+                # Step 3: confirm a transient failure actually retries.
+                calls = {"n": 0}
+                for attempt in retry_context(context):
+                    with attempt:
+                        calls["n"] += 1
+                        if calls["n"] < 2:
+                            raise httpx.ConnectError("transient")
+                assert calls["n"] == 2, (
+                    f"fresh fetch did not retry: only {calls['n']} attempt(s)"
+                )
+            finally:
+                stamina.set_active(False)
+                context.reset_cancel()
+    finally:
+        cu.TILED_RETRY_ATTEMPTS = orig_attempts
+        cu.TILED_RETRY_TIMEOUT = orig_timeout
+
+
+def test_progress_advance_clamped_at_total():
+    # --- Terminal ProgressState ---
+    from rich.console import Console
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress
+
+    from tiled.client.utils import ProgressState
+
+    console = Console(stderr=True, force_terminal=True)
+    progress = Progress(BarColumn(), MofNCompleteColumn(), console=console)
+    task_id = progress.add_task("test", total=3)
+    state = ProgressState(progress, task_id, spinner=None)
+    for _ in range(5):
+        state.advance()
+    assert progress.tasks[task_id].completed == 3, (
+        f"terminal advance overshot: completed="
+        f"{progress.tasks[task_id].completed}"
+    )
+
+    # --- Jupyter shim ---
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    fake_widgets = MagicMock()
+    fake_widgets.IntProgress.return_value = MagicMock(value=0)
+    fake_widgets.HTML.return_value = MagicMock(value="")
+    fake_widgets.HBox.return_value = MagicMock()
+    fake_widgets.Layout.return_value = MagicMock()
+
+    with Context.from_app(app, show_progress=True) as context:
+        with patch.dict(sys.modules, {"ipywidgets": fake_widgets,
+                                       "IPython.display": MagicMock()}), patch(
+            "tiled.client.utils.is_jupyter", return_value=True
+        ), patch("tiled.client.utils.is_interactive", return_value=True):
+            with context.tracking_progress(total=3) as jstate:
+                for _ in range(5):
+                    jstate.advance()
+                assert jstate._completed == 3, (
+                    f"jupyter advance overshot: completed={jstate._completed}"
+                )
+
+
+def test_terminal_progress_does_not_top_up_on_exception():
+    """When the fetch raises, the progress bar must NOT be quietly filled
+    to 100%.  That would mislead the user into thinking the fetch
+    succeeded right before the exception surfaces.
+    """
+    from unittest.mock import patch
+
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    captured = {"state": None}
+
+    with Context.from_app(app, show_progress=True) as context:
+        with patch("tiled.client.utils.is_jupyter", return_value=False), patch(
+            "tiled.client.utils.is_interactive", return_value=True
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                with context.tracking_progress(total=5) as state:
+                    captured["state"] = state
+                    state.advance()
+                    state.advance()
+                    raise RuntimeError("boom")
+
+    state = captured["state"]
+    assert state is not None
+    # Two real advances happened.  The top-up must NOT have filled the
+    # bar to total=5 after the exception.
+    completed = state._progress.tasks[state._task_id].completed
+    assert completed == 2, (
+        f"top-up ran on exception path: completed={completed}, expected 2"
+    )
+
+
+def test_standalone_retry_indicator_show_reset_race_jupyter():
+    """Race in Jupyter path: reset() runs between display(label) and the
+    lock-protected ``self._live = label`` assignment in ``show()``.
+
+    The widget would otherwise be displayed and never closed.  ``show()``
+    must re-check ``_showing`` under lock after ``display()`` and close
+    the widget if a concurrent reset happened.
+    """
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    from tiled.client.utils import StandaloneRetryIndicator
+
+    indicator = StandaloneRetryIndicator()
+
+    fake_label = MagicMock()
+    fake_widgets = MagicMock()
+    fake_widgets.Label.return_value = fake_label
+    fake_ipython_display = MagicMock()
+
+    # Simulate the race by having display() itself call reset() before it
+    # returns — mimicking another thread that flips _showing to False
+    # between widget creation and the orphan check.
+    def racing_display(*args, **kwargs):
+        indicator.reset()
+
+    fake_ipython_display.display.side_effect = racing_display
+
+    with patch.dict(
+        sys.modules,
+        {"ipywidgets": fake_widgets, "IPython.display": fake_ipython_display},
+    ), patch("tiled.client.utils.is_jupyter", return_value=True):
+        indicator.show()
+
+    # The widget must have been closed; otherwise it stays visible forever.
+    fake_label.close.assert_called_once()
+    assert indicator._live is None
+    assert indicator._showing is False
+
+
+def test_tracking_progress_cancel_event_lifecycle():
+    """The outermost tracking_progress clears any stale cancel flag from a
+    previously interrupted fetch; a nested entry must not clear a flag set
+    by its outer caller.
+    """
+    tree_local = MapAdapter({"data": ArrayAdapter.from_array(numpy.zeros((10,)))})
+    app = build_app(tree_local)
+
+    with Context.from_app(app, show_progress=True) as context:
+        # Outermost entry clears stale state.
+        context.request_cancel()
+        assert context.cancel_event.is_set()
+        with context.tracking_progress(total=5):
+            assert not context.cancel_event.is_set(), (
+                "outermost tracking_progress did not clear stale cancel flag"
+            )
+            # Inner caller sets cancel; nested entry must not clobber it.
+            context.request_cancel()
+            with context.tracking_progress(total=1):
+                assert context.cancel_event.is_set(), (
+                    "nested tracking_progress cleared an outer cancel signal"
+                )
+            assert context.cancel_event.is_set()
+
+
+def test_stamina_default_log_hook_stripped_lazily():
+    """Stamina's built-in retry log hook must be removed before tiled's
+    retry path runs, but third-party hooks registered later must survive.
+    """
+    import stamina.instrumentation as si
+
+    from tiled.client import utils as client_utils
+
+    sentinel_calls = []
+
+    def sentinel_hook(details):
+        sentinel_calls.append(details)
+
+    try:
+        from stamina.instrumentation._logging import init_logging
+        si.set_on_retry_hooks([init_logging(), sentinel_hook])
+    except Exception:
+        si.set_on_retry_hooks(list(si.get_on_retry_hooks()) + [sentinel_hook])
+
+    # Reset the lazy guard so we exercise the strip path even if a prior
+    # test already triggered it.
+    client_utils._stamina_log_hook_stripped = False
+    client_utils._strip_stamina_default_log_hook()
+
+    remaining = si.get_on_retry_hooks()
+    assert sentinel_hook in remaining, (
+        "third-party stamina hook was evicted by tiled"
+    )
+    assert not any(
+        getattr(h, "__qualname__", "").startswith("init_logging") for h in remaining
+    ), "stamina default log hook was not stripped"
+
+
+def test_stamina_hook_strip_is_lazy_not_at_import():
+    """Importing tiled.client.utils must not mutate stamina's global hook
+    list — stripping happens lazily on first retry entry.
+    """
+    import importlib
+    import sys
+
+    import stamina.instrumentation as si
+
+    sentinel = lambda details: None  # noqa: E731
+    si.set_on_retry_hooks([sentinel])
+    # Force a reimport of tiled.client.utils.
+    for name in list(sys.modules):
+        if name.startswith("tiled.client.utils"):
+            del sys.modules[name]
+    importlib.import_module("tiled.client.utils")
+    # Sentinel must still be present after import.
+    assert sentinel in si.get_on_retry_hooks(), (
+        "tiled.client.utils import wiped stamina hooks; strip must be lazy"
+    )

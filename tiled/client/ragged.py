@@ -15,7 +15,7 @@ from ..structures.core import STRUCTURE_TYPES
 from ..structures.ragged import RaggedCompatibleType, make_ragged_array
 from ..utils import Conflicts
 from .base import BaseClient
-from .utils import export_util, handle_error, params_from_slice, retry_context
+from .utils import export_util, handle_error, params_from_slice
 
 
 class RaggedClient(BaseClient):
@@ -37,18 +37,16 @@ class RaggedClient(BaseClient):
         if persist is False:
             # Extend the query only for non-default behavior.
             params["persist"] = persist
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        url_path,
-                        content=to_zipped_buffers(
-                            mimetype="application/zip", array=array, metadata={}
-                        ),
-                        headers={"Content-Type": "application/zip"},
-                        params=params,
-                    )
-                )
+        handle_error(
+            self.context.http_client.put(
+                url_path,
+                content=to_zipped_buffers(
+                    mimetype="application/zip", array=array, metadata={}
+                ),
+                headers={"Content-Type": "application/zip"},
+                params=params,
+            )
+        )
 
     def write_block(
         self,
@@ -80,18 +78,16 @@ class RaggedClient(BaseClient):
         if persist is False:
             params["persist"] = persist
 
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        url_path,
-                        content=to_zipped_buffers(
-                            mimetype="application/zip", array=array, metadata={}
-                        ),
-                        headers={"Content-Type": "application/zip"},
-                        params=params,
-                    )
-                )
+        handle_error(
+            self.context.http_client.put(
+                url_path,
+                content=to_zipped_buffers(
+                    mimetype="application/zip", array=array, metadata={}
+                ),
+                headers={"Content-Type": "application/zip"},
+                params=params,
+            )
+        )
 
     def patch(
         self,
@@ -143,32 +139,30 @@ class RaggedClient(BaseClient):
         if persist is False:
             # Extend the query only for non-default behavior.
             params["persist"] = persist
-        for attempt in retry_context():
-            with attempt:
-                response = self.context.http_client.patch(
-                    url_path,
-                    content=to_zipped_buffers(
-                        mimetype="application/zip", array=array, metadata={}
-                    ),
-                    headers={"Content-Type": "application/zip"},
-                    params=params,
+        response = self.context.http_client.patch(
+            url_path,
+            content=to_zipped_buffers(
+                mimetype="application/zip", array=array, metadata={}
+            ),
+            headers={"Content-Type": "application/zip"},
+            params=params,
+        )
+        if response.status_code in [
+            httpx.codes.BAD_REQUEST,
+            httpx.codes.CONFLICT,
+        ]:
+            detail = (
+                response.json()
+                .get("detail", "Array parameters conflict.")
+                .replace(
+                    "Use ?",  # URL query param
+                    "Pass keyword argument ",  # Python function argument
                 )
-                if response.status_code in [
-                    httpx.codes.BAD_REQUEST,
-                    httpx.codes.CONFLICT,
-                ]:
-                    detail = (
-                        response.json()
-                        .get("detail", "Array parameters conflict.")
-                        .replace(
-                            "Use ?",  # URL query param
-                            "Pass keyword argument ",  # Python function argument
-                        )
-                    )
-                    if response.status_code == httpx.codes.CONFLICT:
-                        raise Conflicts(detail)
-                    raise ValueError(detail)
-                handle_error(response)
+            )
+            if response.status_code == httpx.codes.CONFLICT:
+                raise Conflicts(detail)
+            raise ValueError(detail)
+        handle_error(response)
         # Update cached structure.
         new_structure = response.json()
         structure_type = STRUCTURE_TYPES[self.structure_family]
@@ -193,15 +187,13 @@ class RaggedClient(BaseClient):
         else:
             accept_header = "application/zip"
 
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    self.context.http_client.get(
-                        url_path,
-                        headers={"Accept": accept_header},
-                        params=url_params,
-                    )
-                ).read()
+        content = handle_error(
+            self.context.http_client.get(
+                url_path,
+                headers={"Accept": accept_header},
+                params=url_params,
+            )
+        ).read()
 
         if is_scalar:
             return ragged.array(orjson.loads(content))

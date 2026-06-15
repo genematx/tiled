@@ -7,6 +7,7 @@ from collections import defaultdict
 from collections.abc import Hashable
 from dataclasses import asdict
 from pathlib import Path
+import threading
 from threading import Lock
 from typing import Optional, Union
 from urllib.parse import parse_qs, urlparse
@@ -21,12 +22,44 @@ from ..structures.core import Spec
 from ..type_aliases import Chunks
 from ..utils import path_from_uri
 
-# Disable stamina's default retry logging hook.  Tiled handles its own retry
-# messages via the _LoggingAttempt wrapper (routed to tiled.client at DEBUG).
-# Other libraries that register their own stamina hooks are not affected —
-# only the built-in default hook (which emits "stamina.retry_scheduled" at
-# WARNING) is removed.
-stamina.instrumentation.set_on_retry_hooks([])
+# Stamina ships a default retry-logging hook that emits
+# "stamina.retry_scheduled" at WARNING.  Tiled handles its own retry
+# messages via the _LoggingAttempt wrapper (routed to tiled.client at
+# DEBUG), so we strip that built-in hook — but only it, and only on first
+# use of a retry context, to avoid evicting third-party hooks registered
+# before tiled is imported and to avoid any global side effect at import.
+_stamina_log_hook_stripped = False
+_stamina_log_hook_lock = threading.Lock()
+
+
+def _strip_stamina_default_log_hook():
+    """Idempotently remove stamina's built-in retry logging hook.
+
+    Leaves any other hooks (third-party metrics, custom logging, etc.)
+    intact.  Safe to call from any thread; safe to call repeatedly.
+    """
+    global _stamina_log_hook_stripped
+    if _stamina_log_hook_stripped:
+        return
+    with _stamina_log_hook_lock:
+        if _stamina_log_hook_stripped:
+            return
+        try:
+            current = stamina.instrumentation.get_on_retry_hooks()
+            # Stamina's default is the closure returned by init_logging();
+            # match by qualname so we don't reach into private modules.
+            kept = tuple(
+                h
+                for h in current
+                if not getattr(h, "__qualname__", "").startswith("init_logging")
+            )
+            if len(kept) != len(current):
+                stamina.instrumentation.set_on_retry_hooks(kept)
+        except Exception:
+            # If stamina's instrumentation API changes shape, fail open
+            # rather than break retries.
+            pass
+        _stamina_log_hook_stripped = True
 
 MSGPACK_MIME_TYPE = "application/x-msgpack"
 
@@ -163,14 +196,21 @@ class _LoggingAttempt:
     tiled's retry logging is completely isolated: retries triggered by *other*
     libraries that also use stamina are not affected, and tiled's own retries
     are not routed through the global stamina hook machinery.
+
+    The wrapper signals the retry indicator at most once per retry loop
+    (the ``loop_state`` dict is shared across all attempts in a loop) so
+    the indicator refcount stays balanced regardless of attempt count.
     """
 
-    __slots__ = ("_attempt", "_context", "_standalone")
+    __slots__ = ("_attempt", "_context", "_standalone", "_loop_state")
 
-    def __init__(self, attempt, context=None, standalone=None):
+    def __init__(self, attempt, context=None, standalone=None, loop_state=None):
         self._attempt = attempt
         self._context = context
         self._standalone = standalone
+        # Shared across all wrappers in this retry loop:
+        # {"signaled": bool}
+        self._loop_state = loop_state if loop_state is not None else {"signaled": False}
 
     @property
     def num(self):
@@ -180,9 +220,26 @@ class _LoggingAttempt:
         return self._attempt.__enter__()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # If the Context has been asked to cancel (e.g. main thread caught
+        # Ctrl-C while this worker was sleeping inside stamina), refuse the
+        # next retry so the worker exits its retry loop immediately instead
+        # of sleeping again.  Worker threads never receive SIGINT, so they
+        # rely on this cross-thread flag for cancellation.
+        if (
+            self._context is not None
+            and exc_val is not None
+            and self._context.cancel_event.is_set()
+        ):
+            # Returning False from __exit__ lets the exception propagate
+            # out of the `with attempt:` block and out of the retry loop.
+            self._attempt.__exit__(None, None, None)
+            return False
         result = self._attempt.__exit__(exc_type, exc_val, exc_tb)
         # stamina returns True from __exit__ when it suppresses the exception
-        # and schedules a retry.  That is the moment we want to log.
+        # and schedules a retry.  Tenacity always returns True on exception
+        # (it swallows and decides at the next ``next(it)`` whether to retry
+        # or re-raise), so we never see the not-retried case here — that path
+        # is detected in ``retry_context`` when ``next(it)`` raises.
         if exc_val is not None and result:
             _retry_logger.debug(
                 "Retry %d scheduled in %.2fs due to %r",
@@ -190,43 +247,72 @@ class _LoggingAttempt:
                 self._attempt.next_wait,
                 exc_val,
             )
-            if self._context is not None:
-                self._context.signal_retry()
-            elif self._standalone is not None:
-                self._standalone.show()
+            # Show the indicator exactly once per loop, on the first
+            # scheduled retry.  retry_context's finally hides it exactly
+            # once, keeping the Context's retry refcount balanced.
+            if not self._loop_state["signaled"]:
+                self._loop_state["signaled"] = True
+                if self._context is not None:
+                    self._context.signal_retry()
+                elif self._standalone is not None:
+                    self._standalone.show()
         return result
 
 
 def retry_context(context=None):
     "Iterable that yields a context manager per retry attempt"
+    _strip_stamina_default_log_hook()
     # When no context is provided (e.g. from_any_uri probing the server before
     # a Context object exists), we still want to show the retry indicator.
     # Use a standalone indicator owned by this generator so cleanup is guaranteed.
     standalone = StandaloneRetryIndicator() if context is None else None
-    it = stamina.retry_context(
+    it = iter(stamina.retry_context(
         on=should_retry,
         attempts=TILED_RETRY_ATTEMPTS,
         timeout=TILED_RETRY_TIMEOUT,
-    ).__iter__()
+    ))
+    loop_state = {"signaled": False, "failed": False}
     try:
         while True:
             try:
                 attempt = next(it)
             except StopIteration:
                 break
-            except KeyboardInterrupt:
-                # A KeyboardInterrupt raised during stamina's inter-attempt sleep
-                # would normally be swallowed by tenacity.  Re-raise it here so
-                # that Ctrl-C cancels all remaining retries immediately.
+            except BaseException:
+                # Two paths land here:
+                #   1. Tenacity raises the original exception when retries
+                #      are exhausted (or when the attempt's exception was
+                #      not retried at all).
+                #   2. ``KeyboardInterrupt`` raised during stamina's
+                #      inter-attempt sleep — tenacity would normally swallow
+                #      it; re-raising here makes Ctrl-C cancel retries
+                #      immediately.
+                # In both cases the loop has failed permanently and peers
+                # should be notified via ``request_cancel`` (in the finally).
+                loop_state["failed"] = True
                 raise
-            yield _LoggingAttempt(attempt, context=context, standalone=standalone)
+            yield _LoggingAttempt(
+                attempt,
+                context=context,
+                standalone=standalone,
+                loop_state=loop_state,
+            )
     finally:
-        # Always clean up the retry indicator, whether the loop completed
-        # normally, was interrupted, or raised an exception.
-        if standalone is not None:
-            standalone.reset()
-        elif context is not None:
-            context.signal_retry_resolved()
+        # Balance the show with exactly one hide, only if we showed.
+        if loop_state["signaled"]:
+            if standalone is not None:
+                standalone.reset()
+            elif context is not None:
+                context.signal_retry_resolved()
+        # If this loop failed permanently (stamina chose not to retry, or
+        # exhausted retries), tell the rest of the Context's workers to
+        # stop.  Peers blocked on the circuit gate are released; peers
+        # already in their own retry loop observe ``cancel_event`` on the
+        # next attempt and bail.  Rationale: if one chunk is broken or
+        # the server is down, there is no point hammering it with the
+        # remaining workers.
+        if loop_state["failed"] and context is not None:
+            context.request_cancel()
 
 
 def should_poll_for_tokens(exception: Exception) -> bool:
@@ -237,6 +323,7 @@ def should_poll_for_tokens(exception: Exception) -> bool:
 
 
 def polling_retry_context(timeout: float):
+    _strip_stamina_default_log_hook()
     for attempt in stamina.retry_context(
         on=should_poll_for_tokens,
         attempts=TILED_DEVICE_FLOW_ATTEMPTS,
@@ -580,7 +667,7 @@ class ProgressState:
     ``show_retrying()`` / ``hide_retrying()`` around retries.
     """
 
-    __slots__ = ("_progress", "_task_id", "_spinner", "_live", "_retrying")
+    __slots__ = ("_progress", "_task_id", "_spinner", "_live", "_retrying", "_lock")
 
     def __init__(self, progress, task_id, spinner):
         self._progress = progress
@@ -588,10 +675,22 @@ class ProgressState:
         self._spinner = spinner
         self._live = None
         self._retrying = False
+        # Serialises ``advance`` so the bar is never advanced past ``total``
+        # when several worker threads race.  Overshoot would otherwise show
+        # confusing values like "11/10" in the M-of-N column.
+        self._lock = threading.Lock()
 
     def advance(self):
-        """Advance the progress bar by one completed fetch."""
-        self._progress.advance(self._task_id)
+        """Advance the progress bar by one completed fetch.
+
+        Clamped at ``total`` to guard against an over-count in the
+        caller's fetch_count estimate (e.g. when a composite client read
+        recurses into a nested fetch that wasn't included in the total).
+        """
+        with self._lock:
+            task = self._progress.tasks[self._task_id]
+            if task.total is None or task.completed < task.total:
+                self._progress.advance(self._task_id)
 
     def show_retrying(self):
         """Show a spinner below the progress bar indicating a retry is in progress."""
@@ -612,6 +711,36 @@ class ProgressState:
             self._live.update(self._progress)
 
 
+def _run_on_jupyter_main_thread(callback):
+    """Schedule ``callback`` on the running ipykernel's IOLoop.
+
+    Deprecated: kept only for backwards compatibility with any third-party
+    callers.  The internal progress-bar and retry-indicator code now mutates
+    ipywidgets directly from worker threads, because during synchronous cell
+    execution the kernel's IOLoop is blocked — callbacks queued on it would
+    only run after the cell completes, by which time the widget update is no
+    longer useful.
+
+    Falls back to a direct call (best-effort) if ipykernel internals are
+    unavailable.
+    """
+    if threading.current_thread() is threading.main_thread():
+        callback()
+        return
+    try:
+        from IPython import get_ipython
+
+        shell = get_ipython()
+        io_loop = getattr(getattr(shell, "kernel", None), "io_loop", None)
+        if io_loop is not None:
+            io_loop.add_callback(callback)
+            return
+    except Exception:
+        pass
+    # Last resort — direct call, may be unsafe but better than silently dropping.
+    callback()
+
+
 class StandaloneRetryIndicator:
     """Shows a spinner on stderr while retries are in progress.
 
@@ -623,65 +752,133 @@ class StandaloneRetryIndicator:
 
     On non-TTY stderr (CI, pipes): writes a plain "Retrying…" line once.
 
-    Only operates from the main thread so dask worker threads never write to
-    the terminal.
+    Thread-safe: ``show()`` / ``reset()`` may be called from any thread.
+    Terminal output goes through Rich's thread-safe ``Live``; Jupyter widget
+    creation/teardown is routed onto the kernel's IOLoop so the ipywidgets
+    Comm send always originates on the kernel main thread.
     """
 
     def __init__(self):
         self._showing = False
         self._live = None
+        self._lock = threading.Lock()
 
     @staticmethod
     def _stderr_is_tty():
         return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
 
-    def show(self):
-        """Start the spinner (or print plain text) on first call; no-op thereafter."""
-        import threading
+    @staticmethod
+    def _should_render_spinner():
+        """True when we should render a Rich Live spinner on stderr.
 
-        if threading.current_thread() is not threading.main_thread():
-            return
-        if self._showing:
-            return
-        self._showing = True
+        ``sys.stderr.isatty()`` alone is not enough: IPython replaces
+        ``sys.stderr`` with an ``OutStream`` (and in some terminal IDEs the
+        original ``stderr`` is wrapped) whose ``isatty()`` returns ``False``
+        even though the user is in a fully interactive session capable of
+        rendering ANSI escapes.  In those cases we still want a spinner —
+        Rich does the right thing if we pass ``force_terminal=True``.
+        """
+        if StandaloneRetryIndicator._stderr_is_tty():
+            return True
+        # IPython terminal / Jupyter-kernel-via-console / any other REPL.
+        return is_interactive()
+
+    def show(self):
+        """Start the spinner (or print plain text) on first call; no-op thereafter.
+
+        Safe to call from worker threads.
+        """
+        with self._lock:
+            if self._showing:
+                return
+            self._showing = True
+
         if is_jupyter():
+            # Mirror the reasoning in _JupyterProgressState: route widget
+            # creation directly from the calling thread.  Scheduling on the
+            # kernel's IOLoop is tempting but harmful — during synchronous
+            # cell execution the IOLoop is blocked, so a queued create()
+            # would only run after the cell completes, by which time the
+            # retry is either resolved or has failed.  In practice
+            # ipykernel serialises the Comm send so direct mutation from
+            # worker threads is safe.
             try:
                 import ipywidgets as widgets
                 from IPython.display import display
 
-                self._live = widgets.Label(value="⟳ Retrying…")
-                display(self._live)
+                label = widgets.Label(value="⟳ Retrying…")
+                display(label)
+                # Re-check: reset() may have fired between show()'s entry
+                # and the display() call.  If so, close the widget
+                # immediately — otherwise it stays visible forever.
+                with self._lock:
+                    if not self._showing:
+                        orphan = True
+                    else:
+                        self._live = label
+                        orphan = False
+                if orphan:
+                    try:
+                        label.close()
+                    except Exception:
+                        pass
             except ImportError:
                 sys.stderr.write("Retrying…\n")
                 sys.stderr.flush()
-        elif self._stderr_is_tty():
+        elif self._should_render_spinner():
             from rich.console import Console
             from rich.live import Live
             from rich.spinner import Spinner
 
-            console = Console(stderr=True, highlight=False)
+            # force_terminal so the spinner renders even though IPython (and
+            # some IDE-embedded terminals) replace stderr with a non-TTY
+            # stream.  This mirrors what _tracking_progress_terminal does.
+            console = Console(stderr=True, force_terminal=True, highlight=False)
             spinner = Spinner("dots", text="[yellow]Retrying…[/yellow]")
-            self._live = Live(spinner, console=console, transient=True)
-            self._live.start()
+            live = Live(spinner, console=console, transient=True)
+            live.start()
+            # Re-check: a concurrent reset() may have flipped _showing to
+            # False between our show() entry and live.start() returning.
+            # If so, stop the Live now — otherwise it renders forever
+            # because reset() saw self._live == None and bailed.
+            with self._lock:
+                if not self._showing:
+                    orphan = True
+                else:
+                    self._live = live
+                    orphan = False
+            if orphan:
+                try:
+                    live.stop()
+                except Exception:
+                    pass
         else:
             sys.stderr.write("Retrying…\n")
             sys.stderr.flush()
 
     def reset(self):
-        """Stop the spinner (or no-op on non-TTY)."""
-        import threading
+        """Stop the spinner (or no-op on non-TTY).
 
-        if threading.current_thread() is not threading.main_thread():
-            return
-        if not self._showing:
-            return
-        self._showing = False
-        if self._live is not None:
-            if is_jupyter():
-                try:
-                    self._live.close()
-                except Exception:
-                    pass
-            else:
-                self._live.stop()
+        Safe to call from worker threads.
+        """
+        with self._lock:
+            if not self._showing:
+                return
+            self._showing = False
+            live = self._live
             self._live = None
+
+        if live is None:
+            return
+        if is_jupyter():
+            # Direct close on the calling thread — same rationale as show():
+            # the kernel IOLoop may be blocked by synchronous cell exec.
+            try:
+                live.close()
+            except Exception:
+                pass
+        else:
+            try:
+                live.stop()
+            except Exception:
+                pass

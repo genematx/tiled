@@ -3,7 +3,7 @@ import awkward
 from ..serialization.awkward import from_zipped_buffers, to_zipped_buffers
 from ..structures.awkward import project_form
 from .base import BaseClient
-from .utils import export_util, handle_error, retry_context
+from .utils import export_util, handle_error
 
 
 class AwkwardClient(BaseClient):
@@ -38,17 +38,15 @@ class AwkwardClient(BaseClient):
     def write(self, container):
         structure = self.structure()
         components = (structure.form, structure.length, container)
-        for attempt in retry_context():
-            with attempt:
-                handle_error(
-                    self.context.http_client.put(
-                        self.item["links"]["full"],
-                        content=bytes(
-                            to_zipped_buffers("application/zip", components, {})
-                        ),
-                        headers={"Content-Type": "application/zip"},
-                    )
-                )
+        handle_error(
+            self.context.http_client.put(
+                self.item["links"]["full"],
+                content=bytes(
+                    to_zipped_buffers("application/zip", components, {})
+                ),
+                headers={"Content-Type": "application/zip"},
+            )
+        )
 
     def read(self, slice=...):
         structure = self.structure()
@@ -60,15 +58,13 @@ class AwkwardClient(BaseClient):
         projected_form = project_form(form, form_keys_touched)
         # The order is not important, but sort so that the request is deterministic.
         form_keys = sorted(form_keys_touched)
-        for attempt in retry_context():
-            with attempt:
-                content = handle_error(
-                    self.context.http_client.post(
-                        self.item["links"]["buffers"],
-                        headers={"Accept": "application/zip"},
-                        json=form_keys,
-                    )
-                ).read()
+        content = handle_error(
+            self.context.http_client.post(
+                self.item["links"]["buffers"],
+                headers={"Accept": "application/zip"},
+                json=form_keys,
+            )
+        ).read()
         container = from_zipped_buffers(content, projected_form, structure.length)
         projected_array = awkward.from_buffers(
             projected_form, structure.length, container, allow_noncanonical_form=True

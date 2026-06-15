@@ -16,7 +16,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-from .utils import handle_error, retry_context
+from .utils import handle_error
 
 # This extracts the filename to the Content-Disposition header.
 CONTENT_DISPOSITION_PATTERN = re.compile(r"^attachment; ?filename=\"(.*)\"$")
@@ -39,25 +39,23 @@ def _download_url(
     progress.console.log(f"Requesting {url}")
     try:
         path.parent.mkdir(exist_ok=True, parents=True)
-        for attempt in retry_context():
-            with attempt:
-                with client.stream("GET", url) as response:
-                    handle_error(response)
-                    if path.name == ATTACHMENT_FILENAME_PLACEHOLDER:
-                        # Use filename provided by server.
-                        filename = CONTENT_DISPOSITION_PATTERN.match(
-                            response.headers["Content-Disposition"]
-                        ).group(1)
-                        path = Path(path.parent, filename)
-                    with open(path, "wb") as file:
-                        total = int(response.headers["Content-Length"])
-                        progress.update(task_id, total=total)
-                        progress.start_task(task_id)
-                        for chunk in response.iter_bytes():
-                            file.write(chunk)
-                            progress.update(task_id, advance=len(chunk))
-                            if done_event.is_set():
-                                return
+        with client.stream("GET", url) as response:
+            handle_error(response)
+            if path.name == ATTACHMENT_FILENAME_PLACEHOLDER:
+                # Use filename provided by server.
+                filename = CONTENT_DISPOSITION_PATTERN.match(
+                    response.headers["Content-Disposition"]
+                ).group(1)
+                path = Path(path.parent, filename)
+            with open(path, "wb") as file:
+                total = int(response.headers["Content-Length"])
+                progress.update(task_id, total=total)
+                progress.start_task(task_id)
+                for chunk in response.iter_bytes():
+                    file.write(chunk)
+                    progress.update(task_id, advance=len(chunk))
+                    if done_event.is_set():
+                        return
     except Exception as err:
         progress.console.log(f"ERROR {err!r}")
     else:

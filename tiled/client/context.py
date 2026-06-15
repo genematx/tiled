@@ -6,6 +6,7 @@ import threading
 import time
 import urllib.parse
 import warnings
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Literal, Optional
@@ -21,7 +22,7 @@ from .._version import __version__ as tiled_version
 from ..utils import UNSET, DictView, parse_time_string
 from .auth import CannotRefreshAuthentication, TiledAuth, build_refresh_request
 from .decoders import SUPPORTED_DECODERS
-from .transport import Transport
+from .transport import RetryingTransport, Transport
 from .utils import (
     DEFAULT_TIMEOUT_PARAMS,
     MSGPACK_MIME_TYPE,
@@ -237,9 +238,28 @@ class Context:
             max_connections=max_connections,
             max_keepalive_connections=max_connections,
         )
+        # Initialise all retry / cancel / circuit-breaker / indicator state
+        # BEFORE constructing the http_client, because the http_client's
+        # transport (``RetryingTransport``) calls into this Context on every
+        # request — including the initial "safe" request a few lines below.
+        self._init_retry_state()
+        # Whether to show a rich progress bar during multi-chunk fetches.
+        # None means use the TILED_SHOW_PROGRESS env var (default True).
+        if show_progress is None:
+            show_progress = os.getenv(
+                "TILED_SHOW_PROGRESS", "1"
+            ).strip().lower() not in ("0", "false", "no")
+        self.show_progress = show_progress
+        # weakref so the transport never keeps the Context alive — the
+        # Context owns the http_client which owns the transport, so a
+        # strong ref here would be a cycle.
+        self_ref = weakref.ref(self)
         if app is None:
             client = httpx.Client(
-                transport=Transport(cache=cache, limits=limits),
+                transport=RetryingTransport(
+                    Transport(cache=cache, limits=limits),
+                    self_ref,
+                ),
                 verify=verify,
                 timeout=timeout,
                 follow_redirects=True,
@@ -271,7 +291,10 @@ class Context:
             client.headers = headers
             # Do this in the setter to avoid being overwritten.
             client.follow_redirects = True
-            client._transport = Transport(transport=client._transport, cache=cache)
+            client._transport = RetryingTransport(
+                Transport(transport=client._transport, cache=cache),
+                self_ref,
+            )
             client.__enter__()
             # The TestClient is meant to be used only as a context manager,
             # where the context starts and stops and the wrapped ASGI app.
@@ -295,37 +318,21 @@ class Context:
         # that it can be tuned independently; by default it mirrors the pool size.
         self._max_connections = max_connections
         self._concurrent_request_semaphore = threading.Semaphore(max_connections)
-        # Slot used by tracking_progress(). Set to a ProgressState instance
-        # while a tracked .compute() is running; None at all other times.
-        # Assignment of a Python reference is atomic, so dask worker threads
-        # can safely read this without a lock.
-        self._progress_state = None
-        # Whether to show a rich progress bar during multi-chunk fetches.
-        # None means use the TILED_SHOW_PROGRESS env var (default True).
-        if show_progress is None:
-            show_progress = os.getenv(
-                "TILED_SHOW_PROGRESS", "1"
-            ).strip().lower() not in ("0", "false", "no")
-        self.show_progress = show_progress
-        # Lazy-initialized StandaloneRetryIndicator (set by signal_retry)
-        self._retry_indicator = None
 
         # Make an initial "safe" request to:
         # (1) Get the server_info.
         # (2) Let the server set the CSRF cookie.
         # No authentication has been set up yet, so these requests will be unauthenticated.
         # https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html#double-submit-cookie
-        for attempt in retry_context(self):
-            with attempt:
-                server_info = handle_error(
-                    self.http_client.get(
-                        self.api_uri,
-                        headers={
-                            "Accept": MSGPACK_MIME_TYPE,
-                            "Cache-Control": "no-cache, no-store",
-                        },
-                    )
-                ).json()
+        server_info = handle_error(
+            self.http_client.get(
+                self.api_uri,
+                headers={
+                    "Accept": MSGPACK_MIME_TYPE,
+                    "Cache-Control": "no-cache, no-store",
+                },
+            )
+        ).json()
         self.server_info: About = TypeAdapter(About).validate_python(server_info)
         self.api_key = api_key  # property setter sets Authorization header
         self.admin = Admin(self)  # accessor for admin-related requests
@@ -433,9 +440,18 @@ class Context:
             max_connections=max_connections,
             max_keepalive_connections=max_connections,
         )
+        # Initialise retry state BEFORE the http_client (its transport
+        # calls into us on every request).  See __init__ for rationale.
+        self._init_retry_state()
+        # Intentionally False: unpickled contexts run in dask workers which
+        # are not interactive and should never render progress bars.
+        self.show_progress = False
         self.http_client = httpx.Client(
             verify=verify,
-            transport=Transport(cache=cache, limits=limits),
+            transport=RetryingTransport(
+                Transport(cache=cache, limits=limits),
+                weakref.ref(self),
+            ),
             cookies=cookies,
             timeout=timeout,
             headers=headers,
@@ -448,11 +464,45 @@ class Context:
         self.server_info = server_info
         self._max_connections = max_connections
         self._concurrent_request_semaphore = threading.Semaphore(max_connections)
-        self._progress_state = None
+
+    def _init_retry_state(self):
+        """Initialise the retry / cancel / circuit-breaker / indicator state.
+
+        Must run before constructing ``self.http_client``, since the
+        transport (``RetryingTransport``) calls back into the Context on
+        every request — including the bootstrap request issued at the end
+        of ``__init__``.
+        """
+        # Lazy-initialised StandaloneRetryIndicator; set by signal_retry on
+        # the 0→1 transition and cleared by signal_retry_resolved on N→0.
         self._retry_indicator = None
-        # Intentionally False: unpickled contexts run in dask workers which
-        # are not interactive and should never render progress bars.
-        self.show_progress = False
+        # Refcount of in-flight retry loops sharing a single indicator.
+        # Multiple worker threads may signal retries concurrently; the
+        # indicator is shown on the 0→1 transition and hidden on the N→0
+        # transition.  Protected by ``_retry_lock``.
+        self._retry_lock = threading.Lock()
+        self._retry_count = 0
+        # Nesting depth of active tracking_progress() entries.  Single-
+        # threaded (main-thread only); no lock needed.
+        self._tp_depth = 0
+        # Set by the main thread (e.g. on KeyboardInterrupt inside
+        # tracking_progress) to ask all in-flight retry loops — including
+        # those running on dask worker threads, which never see SIGINT —
+        # to abort instead of sleeping and retrying again.
+        self._cancel_event = threading.Event()
+        # Circuit-breaker gate.  When any worker is actively retrying
+        # (``_retry_count > 0``) this event is cleared, so new fetches
+        # block on ``wait_for_circuit()`` instead of piling onto an
+        # already-troubled server.  In-flight fetches are unaffected.
+        # Set by default so the first fetch on a healthy connection
+        # never waits.
+        self._circuit_closed_event = threading.Event()
+        self._circuit_closed_event.set()
+        # Slot used by tracking_progress(). Set to a ProgressState while a
+        # tracked .compute() is running; None otherwise.  Assignment of a
+        # Python reference is atomic, so dask worker threads can read it
+        # without a lock.
+        self._progress_state = None
 
     @property
     def progress_state(self):
@@ -472,6 +522,10 @@ class Context:
         ``total > 1`` *and* the session is interactive.  Otherwise this is a
         no-op context manager.
 
+        On ``KeyboardInterrupt`` raised in the main thread, ``cancel_event``
+        is set so that retry loops on dask worker threads (which never see
+        SIGINT) abort their next attempt instead of sleeping again.
+
         Parameters
         ----------
         total : int
@@ -484,14 +538,34 @@ class Context:
         >>> with context.tracking_progress(total=n):
         ...     result = dask_arr.compute()
         """
+        # Track nesting depth across all tracking_progress entries (whether
+        # or not progress is actually rendered) so a nested call never
+        # clears a cancel flag set by its outer caller.
+        outermost = self._tp_depth == 0
+        self._tp_depth += 1
+        if outermost:
+            self.reset_cancel()
+        try:
+            yield from self._tracking_progress_impl(total)
+        except KeyboardInterrupt:
+            # Signal worker-thread retry loops to bail out of their next
+            # attempt, then re-raise so the user's call site sees the
+            # interrupt as usual.
+            self.request_cancel()
+            raise
+        finally:
+            self._tp_depth -= 1
+
+    def _tracking_progress_impl(self, total):
         from .utils import is_interactive, is_jupyter
 
-        if total <= 1 or not self.show_progress or not is_interactive():
-            yield
-            return
-
-        # If an outer progress bar is already active, defer to it (no nested bars).
-        if self._progress_state is not None:
+        if (
+            total <= 1
+            or not self.show_progress
+            or not is_interactive()
+            # Defer to an outer progress bar already active (no nested bars).
+            or self._progress_state is not None
+        ):
             yield
             return
 
@@ -534,7 +608,7 @@ class Context:
 
         # Minimal ProgressState-compatible shim backed by the ipywidget
         class _JupyterProgressState:
-            __slots__ = ("_bar", "_label", "_total", "_completed", "_start")
+            __slots__ = ("_bar", "_label", "_total", "_completed", "_start", "_lock")
 
             def __init__(self, bar, label, total):
                 self._bar = bar
@@ -542,6 +616,9 @@ class Context:
                 self._total = total
                 self._completed = 0
                 self._start = None
+                # Serialises ``advance`` so ``_completed`` never overshoots
+                # ``_total`` when worker threads race.
+                self._lock = threading.Lock()
 
             def _fmt(self, suffix=""):
                 import time
@@ -564,9 +641,22 @@ class Context:
             def advance(self):
                 import time
 
-                if self._start is None:
-                    self._start = time.monotonic()
-                self._completed += 1
+                # Clamp at total to guard against caller over-count.  Without
+                # this, a composite read that recurses into an unexpected
+                # extra fetch would render "11/10 …" in the label.
+                with self._lock:
+                    if self._completed >= self._total:
+                        return
+                    if self._start is None:
+                        self._start = time.monotonic()
+                    self._completed += 1
+                # Mutating widget value attributes from a worker thread is
+                # safe in practice: ipykernel's IOPub thread serialises the
+                # Comm send.  Routing through the kernel's main IOLoop is
+                # tempting but harmful — during synchronous cell execution
+                # the IOLoop is blocked, so queued callbacks would only run
+                # after the cell completes, making the progress bar appear
+                # frozen.
                 self._bar.value = self._completed
                 self._label.value = self._fmt()
 
@@ -621,12 +711,15 @@ class Context:
             self._progress_state = state
             try:
                 yield state
-            finally:
-                # Top up in case dask.distributed workers dropped advance() calls
+                # Top up in case dask.distributed workers dropped advance()
+                # calls.  Done only on successful completion — if an
+                # exception is in flight, filling the bar to 100% would lie
+                # to the user about what was fetched.
                 completed = progress.tasks[task_id].completed
                 remaining = total - completed
                 if remaining > 0:
                     progress.advance(task_id, remaining)
+            finally:
                 self._progress_state = None
 
     @property
@@ -634,29 +727,118 @@ class Context:
         """Read-only access to the active standalone retry indicator, or None."""
         return self._retry_indicator
 
+    @property
+    def cancel_event(self):
+        """A ``threading.Event`` used to abort in-progress retry loops.
+
+        Worker threads doing tiled fetches via dask never receive ``SIGINT``.
+        The main thread catches ``KeyboardInterrupt`` (typically inside
+        :meth:`tracking_progress`) and sets this event so that each
+        ``retry_context`` loop — including those running on dask worker
+        threads — bails out of its next attempt instead of sleeping again.
+        """
+        return self._cancel_event
+
+    def request_cancel(self):
+        """Signal all in-flight retry loops on this Context to abort."""
+        self._cancel_event.set()
+        # Wake any worker blocked on the circuit-breaker gate so it can
+        # observe the cancel flag and exit promptly.
+        self._circuit_closed_event.set()
+
+    def reset_cancel(self):
+        """Clear the cancellation flag (e.g. before starting a new fetch)."""
+        self._cancel_event.clear()
+
+    def wait_for_circuit(self, poll_interval=0.5):
+        """Block until the retry circuit is closed (no worker is retrying).
+
+        Called at the start of each fetch — before the throttle and before
+        the retry_context — so that when one worker is struggling with
+        repeated failures, peer workers don't pile new requests onto an
+        already-troubled server.  In-flight fetches that have already
+        passed this point continue uninterrupted.
+
+        Returns immediately if cancellation has been requested, so the
+        caller can observe the cancel flag and exit cleanly.
+
+        If no retry loop is currently active but ``cancel_event`` is set,
+        the flag is treated as a stale leftover from a prior failed fetch
+        (whose exception has already propagated to the caller) and
+        cleared.  This ensures that user-initiated single-fetch entry
+        points — which do not pass through ``tracking_progress`` and so
+        never call ``reset_cancel`` themselves — still receive a full
+        retry budget on a fresh request.
+        """
+        with self._retry_lock:
+            if self._retry_count == 0 and self._cancel_event.is_set():
+                self._cancel_event.clear()
+        while not self._circuit_closed_event.wait(timeout=poll_interval):
+            if self._cancel_event.is_set():
+                return
+
     def signal_retry(self):
         """Signal that a retry is in progress.
 
         Shows a retry indicator: a spinner below the active progress bar if one
-        is running, or a standalone animated spinner otherwise.  Always called
-        from the main thread (enforced internally).
+        is running, or a standalone animated spinner otherwise.  Safe to call
+        from any thread.  Multiple concurrent retry loops share a single
+        indicator that stays visible until the last one resolves.
+
+        On the first concurrent retry (0→1 transition), opens the
+        circuit-breaker gate so peer workers starting fresh fetches
+        block in :meth:`wait_for_circuit` instead of hammering a server
+        that has already failed at least one request.
         """
-        if (ps := self._progress_state) is not None:
+        with self._retry_lock:
+            self._retry_count += 1
+            if self._retry_count != 1:
+                # Another worker is already retrying; the indicator is
+                # already visible and the gate is already closed.
+                return
+            # 0→1 transition: close the gate inside the lock so peers
+            # calling ``wait_for_circuit`` cannot slip through the window
+            # between the count increment and the gate change.
+            self._circuit_closed_event.clear()
+            ps = self._progress_state
+            if ps is None and self._retry_indicator is None:
+                self._retry_indicator = StandaloneRetryIndicator()
+            indicator = self._retry_indicator if ps is None else None
+        if ps is not None:
             ps.show_retrying()
         else:
-            # Always show retry notice regardless of show_progress / is_interactive().
-            # Silently retrying without any feedback is confusing in every context.
-            if self._retry_indicator is None:
-                self._retry_indicator = StandaloneRetryIndicator()
-            self._retry_indicator.show()
+            # Always show retry notice regardless of show_progress /
+            # is_interactive(); silently retrying is confusing.
+            indicator.show()
 
     def signal_retry_resolved(self):
-        """Signal that retries have resolved — hide any retry indicator."""
-        if (ps := self._progress_state) is not None:
-            ps.hide_retrying()
-        if self._retry_indicator is not None:
-            self._retry_indicator.reset()
+        """Signal that one retry loop has resolved.
+
+        Hides the retry indicator only after the last concurrent retry has
+        resolved.  Extra calls with no active retry are a no-op.
+
+        On the last concurrent retry (N→0 transition), closes the
+        circuit-breaker gate so peer workers blocked in
+        :meth:`wait_for_circuit` can resume.
+        """
+        with self._retry_lock:
+            if self._retry_count == 0:
+                return
+            self._retry_count -= 1
+            if self._retry_count != 0:
+                return
+            # N→0 transition: open the gate inside the lock so a
+            # concurrent ``signal_retry`` cannot close it (0→1) only to
+            # have us undo that close in the window between releasing the
+            # lock and calling ``set``.
+            self._circuit_closed_event.set()
+            ps = self._progress_state
+            indicator = self._retry_indicator
             self._retry_indicator = None
+        if ps is not None:
+            ps.hide_retrying()
+        if indicator is not None:
+            indicator.reset()
 
     def throttle(self):
         """Context manager that throttles concurrent data-fetch requests.
@@ -828,14 +1010,12 @@ class Context:
         """
         if not self.api_key:
             raise RuntimeError("Not API key is configured for the client.")
-        for attempt in retry_context(self):
-            with attempt:
-                return handle_error(
-                    self.http_client.get(
-                        self.server_info.authentication.links.apikey,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                    )
-                ).json()
+        return handle_error(
+            self.http_client.get(
+                self.server_info.authentication.links.apikey,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+            )
+        ).json()
 
     def create_api_key(self, scopes=None, expires_in=None, note=None, access_tags=None):
         """
@@ -871,20 +1051,18 @@ class Context:
                 "support generating additional API keys."
             )
 
-        for attempt in retry_context(self):
-            with attempt:
-                return handle_error(
-                    self.http_client.post(
-                        authn_links.apikey,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        json={
-                            "scopes": scopes,
-                            "access_tags": access_tags,
-                            "expires_in": expires_in,
-                            "note": note,
-                        },
-                    )
-                ).json()
+        return handle_error(
+            self.http_client.post(
+                authn_links.apikey,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                json={
+                    "scopes": scopes,
+                    "access_tags": access_tags,
+                    "expires_in": expires_in,
+                    "note": note,
+                },
+            )
+        ).json()
 
     def revoke_api_key(self, first_eight):
         """
@@ -901,18 +1079,16 @@ class Context:
             (Any additional characters passed will be truncated.)
         """
         url_path = self.server_info.authentication.links.apikey
-        for attempt in retry_context(self):
-            with attempt:
-                handle_error(
-                    self.http_client.delete(
-                        url_path,
-                        headers={"x-csrf": self.http_client.cookies["tiled_csrf"]},
-                        params={
-                            **parse_qs(urlparse(url_path).query),
-                            "first_eight": first_eight[:8],
-                        },
-                    )
-                )
+        handle_error(
+            self.http_client.delete(
+                url_path,
+                headers={"x-csrf": self.http_client.cookies["tiled_csrf"]},
+                params={
+                    **parse_qs(urlparse(url_path).query),
+                    "first_eight": first_eight[:8],
+                },
+            )
+        )
 
     @property
     def app(self):
@@ -1119,28 +1295,24 @@ class Context:
             self.http_client.auth.client_id,
             self.http_client.auth.scopes,
         )
-        for attempt in retry_context(self):
-            with attempt:
-                token_response = self.http_client.send(refresh_request, auth=None)
-                if token_response.status_code == httpx.codes.UNAUTHORIZED:
-                    raise CannotRefreshAuthentication(
-                        "Session cannot be refreshed. Log in again."
-                    )
-                handle_error(token_response)
+        token_response = self.http_client.send(refresh_request, auth=None)
+        if token_response.status_code == httpx.codes.UNAUTHORIZED:
+            raise CannotRefreshAuthentication(
+                "Session cannot be refreshed. Log in again."
+            )
+        handle_error(token_response)
         tokens = token_response.json()
         self.http_client.auth.sync_tokens(tokens)
         return tokens
 
     def whoami(self):
         "Return information about the currently-authenticated user or service."
-        for attempt in retry_context(self):
-            with attempt:
-                return handle_error(
-                    self.http_client.get(
-                        self.server_info.authentication.links.whoami,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                    )
-                ).json()
+        return handle_error(
+            self.http_client.get(
+                self.server_info.authentication.links.whoami,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+            )
+        ).json()
 
     def logout(self):
         """
@@ -1153,30 +1325,28 @@ class Context:
 
         # Revoke the current session.
         refresh_token = self.http_client.auth.sync_get_token("refresh_token")
-        for attempt in retry_context(self):
-            with attempt:
-                if self.client_id:
-                    id_token = self.http_client.auth.sync_get_token("id_token")
-                    handle_error(
-                        self.http_client.get(
-                            self.server_info.authentication.links.logout,
-                            params={
-                                "id_token_hint": id_token,
-                                "client_id": self.client_id,
-                            },
-                        )
-                    )
-                else:
-                    handle_error(
-                        self.http_client.post(
-                            f"{self.api_uri}auth/session/revoke",
-                            json={"refresh_token": refresh_token},
-                            # Circumvent auth because this request is not authenticated.
-                            # The refresh_token in the body is the relevant proof, not the
-                            # 'Authentication' header.
-                            auth=None,
-                        )
-                    )
+        if self.client_id:
+            id_token = self.http_client.auth.sync_get_token("id_token")
+            handle_error(
+                self.http_client.get(
+                    self.server_info.authentication.links.logout,
+                    params={
+                        "id_token_hint": id_token,
+                        "client_id": self.client_id,
+                    },
+                )
+            )
+        else:
+            handle_error(
+                self.http_client.post(
+                    f"{self.api_uri}auth/session/revoke",
+                    json={"refresh_token": refresh_token},
+                    # Circumvent auth because this request is not authenticated.
+                    # The refresh_token in the body is the relevant proof, not the
+                    # 'Authentication' header.
+                    auth=None,
+                )
+            )
 
         # Clear on-disk state.
         self.http_client.auth.sync_clear_token("access_token")
@@ -1193,16 +1363,14 @@ class Context:
 
         This may be done to ensure that a possibly-leaked refresh token cannot be used.
         """
-        for attempt in retry_context(self):
-            with attempt:
-                handle_error(
-                    self.http_client.delete(
-                        self.server_info.authentication.links.revoke_session.format(
-                            session_id=session_id
-                        ),
-                        headers={"x-csrf": self.http_client.cookies["tiled_csrf"]},
-                    )
-                )
+        handle_error(
+            self.http_client.delete(
+                self.server_info.authentication.links.revoke_session.format(
+                    session_id=session_id
+                ),
+                headers={"x-csrf": self.http_client.cookies["tiled_csrf"]},
+            )
+        )
 
 
 class Admin:
@@ -1220,21 +1388,17 @@ class Admin:
             "offset": offset,
             "limit": limit,
         }
-        for attempt in retry_context(self.context):
-            with attempt:
-                return handle_error(
-                    self.context.http_client.get(url_path, params=params)
-                ).json()
+        return handle_error(
+            self.context.http_client.get(url_path, params=params)
+        ).json()
 
     def show_principal(self, uuid):
         "Show one Principal (user or service) in the authentication database."
-        for attempt in retry_context(self.context):
-            with attempt:
-                return handle_error(
-                    self.context.http_client.get(
-                        f"{self.base_url}/auth/principal/{uuid}"
-                    )
-                ).json()
+        return handle_error(
+            self.context.http_client.get(
+                f"{self.base_url}/auth/principal/{uuid}"
+            )
+        ).json()
 
     def create_api_key(
         self, uuid, scopes=None, expires_in=None, note=None, access_tags=None
@@ -1259,20 +1423,18 @@ class Admin:
             Restrict the access available to the API key by listing specific tags.
             By default, this will have no limits on access tags.
         """
-        for attempt in retry_context(self.context):
-            with attempt:
-                return handle_error(
-                    self.context.http_client.post(
-                        f"{self.base_url}/auth/principal/{uuid}/apikey",
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        json={
-                            "scopes": scopes,
-                            "access_tags": access_tags,
-                            "expires_in": expires_in,
-                            "note": note,
-                        },
-                    )
-                ).json()
+        return handle_error(
+            self.context.http_client.post(
+                f"{self.base_url}/auth/principal/{uuid}/apikey",
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                json={
+                    "scopes": scopes,
+                    "access_tags": access_tags,
+                    "expires_in": expires_in,
+                    "note": note,
+                },
+            )
+        ).json()
 
     def create_service_principal(
         self,
@@ -1287,15 +1449,13 @@ class Admin:
             Specify the role (e.g. user or admin)
         """
         url_path = f"{self.base_url}/auth/principal"
-        for attempt in retry_context(self.context):
-            with attempt:
-                return handle_error(
-                    self.context.http_client.post(
-                        url_path,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        params={**parse_qs(urlparse(url_path).query), "role": role},
-                    )
-                ).json()
+        return handle_error(
+            self.context.http_client.post(
+                url_path,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                params={**parse_qs(urlparse(url_path).query), "role": role},
+            )
+        ).json()
 
     def revoke_api_key(self, uuid, first_eight=None):
         """
@@ -1312,18 +1472,16 @@ class Admin:
             (Any additional characters passed will be truncated.)
         """
         url_path = f"{self.base_url}/auth/principal/{uuid}/apikey"
-        for attempt in retry_context(self.context):
-            with attempt:
-                return handle_error(
-                    self.context.http_client.delete(
-                        url_path,
-                        headers={"Accept": MSGPACK_MIME_TYPE},
-                        params={
-                            **parse_qs(urlparse(url_path).query),
-                            "first_eight": first_eight[:8],
-                        },
-                    )
-                )
+        return handle_error(
+            self.context.http_client.delete(
+                url_path,
+                headers={"Accept": MSGPACK_MIME_TYPE},
+                params={
+                    **parse_qs(urlparse(url_path).query),
+                    "first_eight": first_eight[:8],
+                },
+            )
+        )
 
 
 class CannotPrompt(Exception):
@@ -1353,10 +1511,8 @@ def password_grant(http_client, auth_endpoint, provider, username, password):
         "username": username,
         "password": password,
     }
-    for attempt in retry_context():
-        with attempt:
-            token_response = http_client.post(auth_endpoint, data=form_data, auth=None)
-            handle_error(token_response)
+    token_response = http_client.post(auth_endpoint, data=form_data, auth=None)
+    handle_error(token_response)
     return token_response.json()
 
 
@@ -1367,43 +1523,41 @@ def device_code_grant(
     token_endpoint: Optional[str],
     scopes: str = "openid offline_access",
 ):
-    for attempt in retry_context():
-        with attempt:
-            if client_id and token_endpoint:
-                # The device code will be given to the external OIDC provider.
-                oauth2_spec = True
-                verification_response = http_client.post(
-                    auth_endpoint,
-                    data={"client_id": client_id, "scope": scopes},
-                )
-                handle_error(verification_response)
-                verification = verification_response.json()
-                keys = [
-                    "verification_uri_complete",  # includes code
-                    "verification_uri",
-                    "verification_url",  # non-standard Entra
-                ]
-                for key in keys:
-                    verification_uri = verification.get(key)
-                    if verification_uri:
-                        break
-                else:
-                    raise KeyError(
-                        "Verification response is missing expected keys. "
-                        f"Expected one of {keys}. Got: {verification}"
-                    )
+    if client_id and token_endpoint:
+        # The device code will be given to the external OIDC provider.
+        oauth2_spec = True
+        verification_response = http_client.post(
+            auth_endpoint,
+            data={"client_id": client_id, "scope": scopes},
+        )
+        handle_error(verification_response)
+        verification = verification_response.json()
+        keys = [
+            "verification_uri_complete",  # includes code
+            "verification_uri",
+            "verification_url",  # non-standard Entra
+        ]
+        for key in keys:
+            verification_uri = verification.get(key)
+            if verification_uri:
+                break
+        else:
+            raise KeyError(
+                "Verification response is missing expected keys. "
+                f"Expected one of {keys}. Got: {verification}"
+            )
 
-            else:
-                # The device code will be given to Tiled's own implementation
-                # of device code flow. Tiled will do authorization code from with the
-                # external providers. (This handles cases that ORCID and Globus that do
-                # not support device code flow.)
-                oauth2_spec = False
-                verification_response = http_client.post(auth_endpoint)
-                handle_error(verification_response)
-                verification = verification_response.json()
-                token_endpoint = verification["authorization_uri"]
-                verification_uri = verification["verification_uri"]
+    else:
+        # The device code will be given to Tiled's own implementation
+        # of device code flow. Tiled will do authorization code from with the
+        # external providers. (This handles cases that ORCID and Globus that do
+        # not support device code flow.)
+        oauth2_spec = False
+        verification_response = http_client.post(auth_endpoint)
+        handle_error(verification_response)
+        verification = verification_response.json()
+        token_endpoint = verification["authorization_uri"]
+        verification_uri = verification["verification_uri"]
     print(
         f"""
 You have {int(verification['expires_in']) // 60} minutes to visit this URL
