@@ -1,10 +1,10 @@
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import dask.dataframe
 import numpy
 import pandas
 import pytest
+import ragged
 import sparse
 from numpy.typing import NDArray
 from pytest_mock import MockFixture
@@ -12,11 +12,12 @@ from pytest_mock import MockFixture
 from tiled.access_control.access_policies import ALL_ACCESS
 from tiled.access_control.protocols import AccessPolicy
 from tiled.access_control.scopes import ALL_SCOPES
-from tiled.adapters.awkward_directory_container import DirectoryContainer
 from tiled.adapters.protocols import (
     ArrayAdapter,
     AwkwardAdapter,
     BaseAdapter,
+    BytesAdapter,
+    RaggedAdapter,
     SparseAdapter,
     TableAdapter,
 )
@@ -25,7 +26,9 @@ from tiled.server.schemas import Principal, PrincipalType
 from tiled.storage import Storage
 from tiled.structures.array import ArrayStructure, BuiltinDtype
 from tiled.structures.awkward import AwkwardStructure
+from tiled.structures.bytes import BytesStructure
 from tiled.structures.core import Spec, StructureFamily
+from tiled.structures.ragged import RaggedStructure
 from tiled.structures.sparse import COOStructure
 from tiled.structures.table import TableStructure
 from tiled.type_aliases import JSON, AccessBlob, AccessTags, Filters, Scopes
@@ -109,7 +112,7 @@ class CustomAwkwardAdapter:
 
     def __init__(
         self,
-        container: DirectoryContainer,
+        container: dict[str, bytes],
         structure: AwkwardStructure,
         metadata: Optional[JSON] = None,
         specs: Optional[List[Spec]] = None,
@@ -128,9 +131,6 @@ class CustomAwkwardAdapter:
     def read_buffers(self, form_keys: Optional[List[str]] = None) -> Dict[str, Any]:
         return {"a": 123}
 
-    def write(self, container: DirectoryContainer) -> None:
-        return None
-
     def specs(self) -> List[Spec]:
         return self._specs
 
@@ -142,12 +142,11 @@ def awkwardadapter_protocol_functions(
     adapter: AwkwardAdapter,
     slice: NDSlice,
     form_keys: Optional[List[str]],
-    container: DirectoryContainer,
+    container: dict[str, bytes],
 ) -> None:
     adapter.structure()
     adapter.read()
     adapter.read_buffers(form_keys)
-    adapter.write(container)
     adapter.specs()
     adapter.metadata()
 
@@ -156,15 +155,14 @@ def test_awkwardadapter_protocol(mocker: MockFixture) -> None:
     mock_call = mocker.patch.object(CustomAwkwardAdapter, "structure")
     mock_call2 = mocker.patch.object(CustomAwkwardAdapter, "read")
     mock_call3 = mocker.patch.object(CustomAwkwardAdapter, "read_buffers")
-    mock_call4 = mocker.patch.object(CustomAwkwardAdapter, "write")
-    mock_call5 = mocker.patch.object(CustomAwkwardAdapter, "specs")
-    mock_call6 = mocker.patch.object(CustomAwkwardAdapter, "metadata")
+    mock_call4 = mocker.patch.object(CustomAwkwardAdapter, "specs")
+    mock_call5 = mocker.patch.object(CustomAwkwardAdapter, "metadata")
 
     structure = AwkwardStructure(length=2, form={"a": "b"})
 
     metadata: JSON = {"foo": "bar"}
     anyslice = NDSlice(1, 1, 1)
-    container = DirectoryContainer(directory=Path("somedirectory"), form={})
+    container = {"a": b"data"}
     form_keys = ["a", "b", "c"]
 
     anyawkwardadapter = CustomAwkwardAdapter(container, structure, metadata=metadata)
@@ -175,9 +173,121 @@ def test_awkwardadapter_protocol(mocker: MockFixture) -> None:
     mock_call.assert_called_once()
     mock_call2.assert_called_once()
     mock_call3.assert_called_once_with(form_keys)
-    mock_call4.assert_called_once_with(container)
+    mock_call4.assert_called_once()
     mock_call5.assert_called_once()
-    mock_call6.assert_called_once()
+
+
+class CustomBytesAdapter:
+    structure_family: Literal[StructureFamily.bytes] = StructureFamily.bytes
+    supported_storage: Set[type[Storage]] = set()
+
+    def __init__(
+        self,
+        structure: BytesStructure,
+        metadata: Optional[JSON] = None,
+        specs: Optional[List[Spec]] = None,
+    ) -> None:
+        self._structure = structure
+        self._metadata = metadata or {}
+        self._specs = list(specs or [])
+
+    def structure(self) -> BytesStructure:
+        return self._structure
+
+    def specs(self) -> List[Spec]:
+        return self._specs
+
+    def metadata(self) -> JSON:
+        return self._metadata
+
+
+def bytesadapter_protocol_functions(adapter: BytesAdapter) -> None:
+    adapter.structure()
+    adapter.specs()
+    adapter.metadata()
+
+
+def test_bytesadapter_protocol(mocker: MockFixture) -> None:
+    mock_call = mocker.patch.object(CustomBytesAdapter, "structure")
+    mock_call2 = mocker.patch.object(CustomBytesAdapter, "specs")
+    mock_call3 = mocker.patch.object(CustomBytesAdapter, "metadata")
+
+    structure = BytesStructure()
+    metadata: JSON = {"foo": "bar"}
+
+    anybytesadapter = CustomBytesAdapter(structure, metadata=metadata)
+    assert anybytesadapter.structure_family == StructureFamily.bytes
+
+    bytesadapter_protocol_functions(anybytesadapter)
+    mock_call.assert_called_once()
+    mock_call2.assert_called_once()
+    mock_call3.assert_called_once()
+
+
+class CustomRaggedAdapter:
+    structure_family: Literal[StructureFamily.ragged] = StructureFamily.ragged
+    supported_storage: Set[type[Storage]] = set()
+
+    def __init__(
+        self,
+        array: ragged.array,
+        structure: RaggedStructure,
+        metadata: Optional[JSON] = None,
+        specs: Optional[List[Spec]] = None,
+    ) -> None:
+        self._array = array
+        self._structure = structure
+        self._metadata = metadata or {}
+        self._specs = list(specs or [])
+
+    def structure(self) -> RaggedStructure:
+        return self._structure
+
+    def read(self, slice: Optional[NDSlice] = None) -> ragged.array:
+        return self._array
+
+    def specs(self) -> List[Spec]:
+        return self._specs
+
+    def metadata(self) -> JSON:
+        return self._metadata
+
+
+def raggedadapter_protocol_functions(
+    adapter: RaggedAdapter, slice: Optional[NDSlice]
+) -> None:
+    adapter.structure()
+    adapter.read(slice)
+    adapter.specs()
+    adapter.metadata()
+
+
+def test_raggedadapter_protocol(mocker: MockFixture) -> None:
+    mock_call = mocker.patch.object(CustomRaggedAdapter, "structure")
+    mock_call2 = mocker.patch.object(CustomRaggedAdapter, "read")
+    mock_call3 = mocker.patch.object(CustomRaggedAdapter, "specs")
+    mock_call4 = mocker.patch.object(CustomRaggedAdapter, "metadata")
+
+    structure = RaggedStructure(
+        data_type=BuiltinDtype.from_numpy_dtype(numpy.dtype("float64")),
+        shape=(2, None),
+        size=5,
+        chunks=((1, 1), None),
+        dims=("time", "x"),
+    )
+
+    array = ragged.array([[1.0, 2.0, 3.0], [4.0, 5.0]])
+    metadata: JSON = {"foo": "bar"}
+    anyslice = NDSlice(0)
+
+    anyraggedadapter = CustomRaggedAdapter(array, structure, metadata=metadata)
+    assert anyraggedadapter.structure_family == StructureFamily.ragged
+
+    raggedadapter_protocol_functions(anyraggedadapter, anyslice)
+    mock_call.assert_called_once()
+    mock_call2.assert_called_once_with(anyslice)
+    mock_call3.assert_called_once()
+    mock_call4.assert_called_once()
 
 
 class CustomSparseAdapter:
@@ -404,7 +514,7 @@ class CustomAccessPolicy(AccessPolicy):
         authn_scopes: Scopes,
     ) -> Scopes:
         allowed = self.scopes
-        somemetadata = node.metadata()  # noqa: 841
+        somemetadata = node.metadata()  # noqa: F841
         return allowed
 
     async def filters(
@@ -416,7 +526,7 @@ class CustomAccessPolicy(AccessPolicy):
         scopes: Scopes,
     ) -> Filters:
         queries: Filters = ALL_ACCESS
-        somespecs = node.specs()  # noqa: 841
+        somespecs = node.specs()  # noqa: F841
         return queries
 
 
@@ -442,7 +552,7 @@ async def test_accesspolicy_protocol(mocker: MockFixture) -> None:
     structure = AwkwardStructure(length=2, form={"a": "b"})
 
     metadata: JSON = {"foo": "bar"}
-    container = DirectoryContainer(directory=Path("somedirectory"), form={})
+    container = {"a": b"data"}
     principal = Principal(
         uuid="12345678124123412345678123456781", type=PrincipalType.user
     )

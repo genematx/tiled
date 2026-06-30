@@ -7,7 +7,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from functools import cache, partial
 from pathlib import Path
-from typing import Callable, List, Optional, TypeVar, Union
+from typing import Callable, List, Literal, Optional, TypeVar, Union
 
 import anyio
 import packaging
@@ -71,9 +71,7 @@ from .authentication import (
 )
 from .connection_pool import get_database_session_factory
 from .core import (
-    DEFAULT_PAGE_SIZE,
     DEPTH_LIMIT,
-    MAX_PAGE_SIZE,
     NoEntry,
     UnsupportedMediaTypes,
     WrongTypeForRoute,
@@ -87,6 +85,7 @@ from .core import (
     resolve_media_type,
 )
 from .dependencies import (
+    PaginationParams,
     expected_shape,
     get_entry,
     get_root_tree,
@@ -96,6 +95,7 @@ from .dependencies import (
     patch_offset_param,
     patch_shape_param,
     shape_param,
+    sorting_param,
 )
 from .settings import Settings, get_settings
 from .utils import (
@@ -233,9 +233,11 @@ def get_router(
                     "mode": "external",
                     "links": {
                         "auth_endpoint": authenticator.device_authorization_endpoint,
+                        "authorize_endpoint": f"{base_url}/auth/provider/{provider}/authorize",
                         "client_id": authenticator.device_flow_client_id,
                         "token_endpoint": authenticator.token_endpoint,
                     },
+                    "extra_scopes": getattr(authenticator, "extra_scopes", []),
                     "confirmation_message": getattr(
                         authenticator, "confirmation_message", None
                     ),
@@ -315,11 +317,8 @@ def get_router(
         path: str,
         fields: Optional[List[schemas.EntryFields]] = Query(list(schemas.EntryFields)),
         select_metadata: Optional[str] = Query(None),
-        offset: Optional[int] = Query(0, alias="page[offset]", ge=0),
-        limit: Optional[int] = Query(
-            DEFAULT_PAGE_SIZE, alias="page[limit]", ge=0, le=MAX_PAGE_SIZE
-        ),
-        sort: Optional[str] = Query(None),
+        page: PaginationParams = Depends(),
+        sort: Optional[List[tuple[str, Literal[1, -1]]]] = Depends(sorting_param),
         max_depth: Optional[int] = Query(None, ge=0, le=DEPTH_LIMIT),
         omit_links: bool = Query(False),
         include_data_sources: bool = Query(False),
@@ -355,8 +354,7 @@ def get_router(
                 entry,
                 "/search",
                 path,
-                offset,
-                limit,
+                page,
                 fields,
                 select_metadata,
                 omit_links,
@@ -819,6 +817,7 @@ def get_router(
             {
                 StructureFamily.array,
                 StructureFamily.container,
+                StructureFamily.ragged,
                 StructureFamily.sparse,
                 StructureFamily.table,
             },
@@ -834,6 +833,218 @@ def get_router(
         uri = f"{base_websocket_url.replace(scheme=scheme)}/array/full/{path_str}"
         handler = entry.make_ws_handler(websocket, formatter, uri)
         await handler(start, already_accepted=needs_first_message_auth)
+
+    @router.get(
+        "/ragged/full/{path:path}", response_model=schemas.Response, name="ragged full"
+    )
+    async def get_ragged_full(
+        request: Request,
+        path: str,
+        slice: NDSlice = Depends(parse_slice_param),
+        format: Optional[str] = None,
+        filename: Optional[str] = None,
+        settings: Settings = Depends(get_settings),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[AccessTags] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["read:data"]),
+    ):
+        entry = await get_entry(
+            path=path,
+            security_scopes=["read:data"],
+            principal=principal,
+            authn_access_tags=authn_access_tags,
+            authn_scopes=authn_scopes,
+            root_tree=root_tree,
+            session_state=session_state,
+            metrics=request.state.metrics,
+            structure_families={StructureFamily.ragged},
+            access_policy=getattr(request.app.state, "access_policy", None),
+        )
+        structure_family = entry.structure_family
+
+        from ..structures.ragged import CanonicalRaggedArray, RaggedSlicingError
+
+        try:
+            with record_timing(request.state.metrics, "read"):
+                array: CanonicalRaggedArray = await ensure_awaitable(entry.read, slice)
+        except RaggedSlicingError as err:
+            raise HTTPException(
+                status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "Cannot apply the requested slice to the given ragged array. "
+                    "Try reading the entire array and slice it on the client side instead."
+                ),
+            ) from err
+
+        if array._impl.nbytes > settings.response_bytesize_limit:
+            raise HTTPException(
+                status_code=HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Response would exceed {settings.response_bytesize_limit}. "
+                    "Use slicing ('?slice=...') to request smaller chunks."
+                ),
+            )
+        try:
+            with record_timing(request.state.metrics, "pack"):
+                return await construct_data_response(
+                    structure_family,
+                    serialization_registry,
+                    array,
+                    entry.metadata(),
+                    request,
+                    format,
+                    specs=getattr(entry, "specs", []),
+                    expires=getattr(entry, "content_stale_at", None),
+                    filename=filename,
+                )
+        except UnsupportedMediaTypes as err:
+            raise HTTPException(
+                status_code=HTTP_406_NOT_ACCEPTABLE, detail=err.args[0]
+            ) from err
+
+    @router.put("/ragged/full/{path:path}")
+    async def put_ragged_full(
+        request: Request,
+        path: str,
+        persist: bool = Query(True, description="Persist data to storage"),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[AccessTags] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
+    ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.ragged},
+            getattr(request.app.state, "access_policy", None),
+        )
+        if not hasattr(entry, "write"):
+            raise HTTPException(
+                status_code=HTTP_405_METHOD_NOT_ALLOWED,
+                detail="This node cannot accept array data.",
+            )
+
+        media_type = request.headers["content-type"]
+        deserializer = deserialization_registry.dispatch("ragged", media_type)
+
+        body = await request.body()
+        await ensure_awaitable(
+            entry.write, media_type, deserializer, entry, body, persist
+        )
+
+        return json_or_msgpack(request, None)
+
+    @router.put("/ragged/block/{path:path}")
+    async def put_ragged_block(
+        request: Request,
+        path: str,
+        block: NDBlock = Depends(parse_block_param),
+        persist: bool = Query(True, description="Persist data to storage"),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[AccessTags] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
+    ):
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.ragged},
+            getattr(request.app.state, "access_policy", None),
+        )
+        if not hasattr(entry, "write_block"):
+            raise HTTPException(
+                status_code=HTTP_405_METHOD_NOT_ALLOWED,
+                detail="This node cannot accept blocks of ragged array data.",
+            )
+
+        media_type = request.headers["content-type"]
+        deserializer = deserialization_registry.dispatch("ragged", media_type)
+
+        body = await request.body()
+        await ensure_awaitable(
+            entry.write_block, block, media_type, deserializer, entry, body, persist
+        )
+
+        return json_or_msgpack(request, None)
+
+    @router.patch("/ragged/full/{path:path}")
+    async def patch_ragged_full(
+        request: Request,
+        path: str,
+        shape=Depends(shape_param),
+        offset=Depends(offset_param),
+        extend: bool = Query(
+            False, description="Extend the array shape to fit the new data"
+        ),
+        persist: bool = Query(True, description="Persist data to storage"),
+        principal: Optional[Principal] = Depends(get_current_principal),
+        root_tree=Depends(get_root_tree),
+        session_state: dict = Depends(get_session_state),
+        authn_access_tags: Optional[AccessTags] = Depends(get_current_access_tags),
+        authn_scopes: Scopes = Depends(get_current_scopes),
+        _=Security(check_scopes, scopes=["write:data"]),
+    ):
+        if extend and not persist:
+            msg = (
+                "Cannot PATCH a ragged array with both parameters"
+                " extend=True and persist=False."
+                " To extend the array, you must persist the changes."
+                " To skip persisting the changes, you must not extend the array."
+            )
+            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=msg)
+
+        entry = await get_entry(
+            path,
+            ["write:data"],
+            principal,
+            authn_access_tags,
+            authn_scopes,
+            root_tree,
+            session_state,
+            request.state.metrics,
+            {StructureFamily.ragged},
+            getattr(request.app.state, "access_policy", None),
+        )
+        if not hasattr(entry, "patch"):
+            raise HTTPException(
+                status_code=HTTP_405_METHOD_NOT_ALLOWED,
+                detail="This node does not support patching ragged array data.",
+            )
+
+        body = await request.body()
+        media_type = request.headers["content-type"]
+        deserializer = deserialization_registry.dispatch("ragged", media_type)
+        structure = await ensure_awaitable(
+            entry.patch,
+            shape,
+            offset,
+            extend,
+            media_type,
+            deserializer,
+            entry,
+            body,
+            persist,
+        )
+        return json_or_msgpack(request, structure)
 
     @router.get(
         "/table/partition/{path:path}",
@@ -1528,10 +1739,8 @@ def get_router(
         import awkward
 
         with record_timing(request.state.metrics, "read"):
-            container = await ensure_awaitable(entry.read)
-        structure = entry.structure()
-        components = (structure.form, structure.length, container)
-        array = awkward.from_buffers(*components)
+            array = await ensure_awaitable(entry.read)
+
         if array.nbytes > settings.response_bytesize_limit:
             raise HTTPException(
                 status_code=HTTP_400_BAD_REQUEST,
@@ -1541,6 +1750,7 @@ def get_router(
                 ),
             )
         try:
+            components = awkward.to_buffers(array)
             with record_timing(request.state.metrics, "pack"):
                 return await construct_data_response(
                     structure_family,
@@ -2287,10 +2497,7 @@ def get_router(
     async def get_revisions(
         request: Request,
         path: str,
-        offset: Optional[int] = Query(0, alias="page[offset]", ge=0),
-        limit: Optional[int] = Query(
-            DEFAULT_PAGE_SIZE, alias="page[limit]", ge=0, le=MAX_PAGE_SIZE
-        ),
+        page: PaginationParams = Depends(),
         principal: Optional[Principal] = Depends(get_current_principal),
         root_tree=Depends(get_root_tree),
         session_state: dict = Depends(get_session_state),
@@ -2322,8 +2529,7 @@ def get_router(
             base_url,
             "/revisions",
             path,
-            offset,
-            limit,
+            page,
             resolve_media_type(request),
         )
         return json_or_msgpack(request, resource.model_dump())

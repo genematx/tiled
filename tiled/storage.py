@@ -2,8 +2,9 @@ import dataclasses
 import functools
 import os
 from abc import abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Literal, Optional, Union
+from typing import TYPE_CHECKING, Dict, Iterator, Literal, Optional, Union
 from urllib.parse import urlparse, urlunparse
 
 import sqlalchemy.pool
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from obstore.store import AzureStore, GCSStore, LocalStore, S3Store
 
 __all__ = [
+    "DirectoryContainer",
     "EmbeddedSQLStorage",
     "RemoteSQLStorage",
     "FileStorage",
@@ -23,6 +25,7 @@ __all__ = [
     "Storage",
     "get_storage",
     "parse_storage",
+    "unregister_storage",
 ]
 
 
@@ -133,7 +136,7 @@ class ObjectStorage(Storage):
         object.__setattr__(self, "bucket", bucket_name)
 
     @classmethod
-    def parse_blob_uri(cls, uri: str) -> tuple[str, str]:
+    def parse_blob_uri(cls, uri: str) -> tuple[str, str, str]:
         """Split a blob URI into base URI, bucket name (optionally), and the prefix.
 
         For example, given 'http://example.com/bucket_name/path/to/blob',
@@ -380,6 +383,11 @@ def register_storage(storage: Storage) -> None:
     _STORAGE[storage.uri] = storage
 
 
+def unregister_storage(storage: Storage) -> None:
+    "Remove Storage from the registry (call after dispose to release all references)."
+    _STORAGE.pop(storage.uri, None)
+
+
 def get_storage(uri: str) -> Storage:
     "Look up Storage by URI."
 
@@ -387,3 +395,54 @@ def get_storage(uri: str) -> Storage:
         uri, _, _ = ObjectStorage.parse_blob_uri(uri)
 
     return _STORAGE[uri]
+
+
+def size_from_uri(data_uri: str) -> int:
+    """Return the byte length of the asset at `data_uri`.
+
+    Dispatches on URI scheme: `file://` URIs are stat'd on the local
+    filesystem; object-store URIs (those in `SUPPORTED_OBJECT_URI_SCHEMES`)
+    issue a HEAD via obstore. Raises `ValueError` for any other scheme.
+    Underlying I/O errors (`FileNotFoundError`, network errors, etc.)
+    propagate; callers that want best-effort behavior should catch them at
+    the call site.
+    """
+    scheme = urlparse(data_uri).scheme
+    if scheme == "file":
+        return path_from_uri(data_uri).stat().st_size
+    if scheme in SUPPORTED_OBJECT_URI_SCHEMES:
+        storage = get_storage(data_uri)
+        _, _, path = ObjectStorage.parse_blob_uri(data_uri)
+        store = storage.get_obstore_location()
+        return int(store.head(path)["size"])
+    raise ValueError(
+        f"Cannot stat URI with unsupported scheme {scheme!r}: {data_uri!r}"
+    )
+
+
+class DirectoryContainer(Mapping[str, bytes]):
+    """A storage container for byte-arrays representing Awkward Array buffers
+
+    Each buffer is stored as a separate file in a given directory, with the
+    filename corresponding to the form key.
+    """
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+
+    def __getitem__(self, key: str) -> bytes:
+        with open(self.directory / key, "rb") as file:
+            return file.read()
+
+    def __setitem__(self, key: str, value: bytes) -> None:
+        with open(self.directory / key, "wb") as file:
+            file.write(value)
+
+    def __delitem__(self, key: str) -> None:
+        (self.directory / key).unlink(missing_ok=True)
+
+    def __iter__(self) -> Iterator[str]:
+        yield from (p.name for p in self.directory.iterdir())
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self.__iter__())
