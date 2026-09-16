@@ -7,6 +7,10 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 ### Changed
 
+- Replace the `nodes` `top_level_metadata` GIN index (a `btree_gin` over
+  `parent, time_created, id, metadata, access_blob`) with a focused
+  `GIN (metadata jsonb_path_ops)` index on PostgreSQL. On SQLite the
+  old index is dropped with no replacement (metadata search uses `json_each`/FTS5).
 - Replace catalog `access_blob` column with a normalized `access_tags` table.
   Tags, grants, tag ownership, and node-tag associations now live in the
   catalog database; graph entities and links share the same tags table,
