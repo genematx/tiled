@@ -291,6 +291,34 @@ def retry_context(context=None, *, on=None):
             context.signal_retry_resolved()
 
 
+async def retry_context_async(context=None, *, on=None):
+    """Async counterpart of `retry_context`.
+
+    Yields one context manager per retry attempt, exactly as
+    `retry_context` does, but backs off between attempts without blocking
+    the event loop (stamina supports async iteration natively). The
+    attempt itself remains a plain sync context manager; no I/O happens
+    in its `__enter__`/`__exit__`.
+    """
+    on = on if on is not None else should_retry
+    try:
+        async for attempt in stamina.retry_context(
+            on=on,
+            attempts=TILED_RETRY_ATTEMPTS,
+            timeout=TILED_RETRY_TIMEOUT,
+        ):
+            if attempt.num > 1:
+                # See the comment in `retry_context`: reaching a second (or
+                # later) attempt means a retry has genuinely been scheduled.
+                _retry_logger.debug("Retrying (attempt %d)…", attempt.num)
+                if context is not None:
+                    context.signal_retry()
+            yield _LoggingAttempt(attempt, context=context)
+    finally:
+        if context is not None:
+            context.signal_retry_resolved()
+
+
 def should_poll_for_tokens(exception: Exception) -> bool:
     # Retry on transient network errors during device flow polling.
     if isinstance(exception, (httpx.ConnectError, httpx.TimeoutException)):
@@ -315,6 +343,22 @@ class TiledResponse(httpx.Response):
                 timestamp=3,  # Decode msgpack Timestamp as datetime.datetime object.
             )
         return super().json()
+
+
+def response_json(response: httpx.Response):
+    """Decode a response body, handling Tiled's msgpack content type.
+
+    The sync client's custom transport produces `TiledResponse`, whose
+    `json()` already decodes msgpack; the experimental async client uses a
+    plain `httpx.AsyncClient`, so shared client logic (e.g. requestor
+    generators) must decode here, identically for both.
+    """
+    if response.headers.get("Content-Type") == MSGPACK_MIME_TYPE:
+        return msgpack.unpackb(
+            response.content,
+            timestamp=3,  # Decode msgpack Timestamp as datetime.datetime object.
+        )
+    return response.json()
 
 
 class UnknownStructureFamily(KeyError):
@@ -568,7 +612,7 @@ def chunks_repr(chunks: Chunks) -> str:
 
 
 def normalize_specs(
-    specs: Optional[Union[list[str], list[Spec], str]]
+    specs: Optional[Union[list[str], list[Spec], str]],
 ) -> Optional[list[dict[str, str]]]:
     "Represent a list of Spec objects or strings as a list of dicts"
 

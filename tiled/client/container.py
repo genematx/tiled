@@ -10,7 +10,7 @@ import uuid
 import warnings
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 import entrypoints
@@ -32,6 +32,7 @@ from ..utils import (
     node_repr,
     safe_json_dump,
 )
+from ._requestor import Requestor, TiledRequest, send_requests
 from .base import STRUCTURE_TYPES, BaseClient
 from .utils import (
     MSGPACK_MIME_TYPE,
@@ -41,6 +42,7 @@ from .utils import (
     export_util,
     handle_error,
     normalize_specs,
+    response_json,
     retry_context,
 )
 
@@ -58,6 +60,240 @@ def _as_spec_set(spec_dicts):
     # specs on a fetched item -- are lists of {"name": ..., "version": ...}
     # dicts; represent them as a set for order-insensitive comparison.
     return {(spec["name"], spec.get("version")) for spec in (spec_dicts or [])}
+
+
+def _adopt_requestor(
+    self_link: str,
+    key: str,
+    structure_family: StructureFamily,
+    specs: List[Dict[str, Any]],
+    metadata: Dict[str, Any],
+    include_data_sources: bool,
+) -> Requestor[Optional[Dict[str, Any]]]:
+    """Fetch an existing item after a retried create hit 409 Conflict.
+
+    Called only when an earlier attempt of the same create request may have
+    reached the server (the response was lost to a transport error, or a
+    proxy/server returned 5xx after the fact), so the existing node under
+    `key` is most likely the one created by our own earlier attempt. To
+    guard against adopting a genuinely unrelated node (a true key
+    collision), the existing node must match the request: same structure
+    family, same specs, and the same metadata (compared after the same JSON
+    normalization that a create applies to the submitted metadata).
+    Otherwise return None and let the caller re-raise the original 409.
+
+    NB: a server-side spec validator that *modifies* metadata on ingestion
+    will defeat the metadata comparison, so in such deployments a retried
+    create degrades to the old behavior (the 409 is raised). This is the
+    conservative trade-off: never adopt a node we can not positively match.
+    """
+    link = self_link.rstrip("/") + f"/{key}"
+    params: Dict[str, Any] = dict(parse_qs(urlparse(link).query))
+    if include_data_sources:
+        params["include_data_sources"] = True
+    try:
+        response = yield TiledRequest(
+            "GET", link, params=params, headers={"Accept": MSGPACK_MIME_TYPE}
+        )
+        existing = response_json(response)["data"]
+    except Exception:
+        logger.warning(
+            "Create of %r returned 409 Conflict after a retried request, "
+            "but the existing item could not be fetched; treating as a "
+            "genuine conflict.",
+            key,
+        )
+        return None
+
+    existing_attrs = existing["attributes"]
+    existing_family = StructureFamily(existing_attrs["structure_family"])
+    # The elif chain evaluates lazily, so cheaper checks short-circuit the
+    # more expensive ones (the metadata check serializes the submitted
+    # metadata with the same JSON round-trip normalization that a create
+    # applies: numpy scalars, datetimes, etc. become plain JSON types).
+    if existing_family != structure_family:
+        mismatch = f"structure_family {existing_family!r} != {structure_family!r}"
+    elif _as_spec_set(existing_attrs.get("specs")) != _as_spec_set(specs):
+        mismatch = f"specs {existing_attrs.get('specs')!r} != {specs!r}"
+    elif existing_attrs.get("metadata") != orjson.loads(safe_json_dump(metadata or {})):
+        mismatch = "metadata differs"
+    else:
+        mismatch = None
+
+    if mismatch is not None:
+        logger.warning(
+            "Create of %r returned 409 Conflict after a retried request, "
+            "but the existing item does not match the request (%s); "
+            "treating as a genuine conflict.",
+            key,
+            mismatch,
+        )
+        return None
+
+    logger.warning(
+        "Create of %r returned 409 Conflict after a retried request that "
+        "may have reached the server; adopting the existing (matching) "
+        "item as the result of this create.",
+        key,
+    )
+    return existing
+
+
+def _new_requestor(
+    *,
+    self_link: str,
+    ancestors: List[str],
+    structure_family: Union[str, StructureFamily],
+    data_sources: List[DataSource],
+    key: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    specs: Optional[List[Union[str, Spec]]],
+    access_tags: Optional[List[str]],
+    server_library_version: str,
+    include_data_sources: bool = False,
+) -> Requestor[Tuple[Dict[str, Any], Any, bool]]:
+    """Requestor generator that creates a new item under a container node.
+
+    The full orchestration of a create, shared by the sync `Container.new`
+    and the async `AsyncContainer.new`: build the request body (including
+    server-version backcompat and the client-generated key that acts as an
+    idempotency token), POST it, track across retries whether any failed
+    attempt may have reached the server, adopt the existing node after a
+    409 Conflict on a retried create (via `_adopt_requestor`), and
+    post-process the response document.
+
+    Returns a tuple `(item, structure, adopted)` with enough information
+    for each shell to dispatch a client object: the item document of the
+    new (or adopted) node; the structure to hand to the client (None when
+    adopted -- the adopted item carries its own structure); and whether an
+    existing node was adopted.
+    """
+    metadata = metadata or {}
+    structure_family = StructureFamily(structure_family)
+    normalized_specs = normalize_specs(specs or [])
+
+    # Backompatibility: if the server is older than 0.2.4,
+    # it can not accept the "properties" field in the data source.
+    # This can be removed in later releases.
+    if Version(server_library_version) < Version("0.2.4"):
+        data_sources_as_dicts = [
+            {k: v for k, v in asdict(ds).items() if k != "properties"}
+            for ds in data_sources
+        ]
+    else:
+        data_sources_as_dicts = [asdict(ds) for ds in data_sources]
+
+    item = {
+        "attributes": {
+            "ancestors": ancestors,
+            "metadata": metadata,
+            "structure_family": structure_family,
+            "specs": normalized_specs,
+            "data_sources": data_sources_as_dicts,
+            "access_tags": access_tags,
+        }
+    }
+    if key is None:
+        key = str(uuid.uuid4())
+    body = dict(item["attributes"])
+    body["id"] = key
+
+    if any(data_source.assets for data_source in data_sources):
+        endpoint = self_link.replace("/metadata/", "/register/", 1)
+    else:
+        endpoint = self_link
+
+    # Track whether any failed attempt may have been received and processed
+    # by the server: the request was sent but the response was lost (read/
+    # write transport error) or a proxy/server-side error (5xx) occurred
+    # after the fact. In that case a 409 Conflict on a subsequent retry
+    # most likely refers to the node created by our own earlier attempt
+    # (every create carries a key -- supplied or client-generated -- that
+    # acts as an idempotency token), so adopt it instead of failing.
+    #
+    # The retry loop lives in the driver (stamina-driven), so this
+    # generator only sees the *final* exception; `observe_attempt_error`
+    # is invoked by the driver with each intermediate failure so the state
+    # can be accumulated here.
+    may_have_reached_server = False
+
+    def observe_attempt_error(exc: Exception) -> None:
+        nonlocal may_have_reached_server
+        if isinstance(exc, SENT_REQUEST_TRANSPORT_ERRORS):
+            may_have_reached_server = True
+        elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
+            may_have_reached_server = True
+
+    try:
+        response = yield TiledRequest(
+            "POST",
+            endpoint,
+            headers={
+                "Accept": MSGPACK_MIME_TYPE,
+                "Content-Type": "application/json",
+            },
+            content=safe_json_dump(body),
+            on_attempt_error=observe_attempt_error,
+        )
+    except httpx.HTTPStatusError as err:
+        if may_have_reached_server and err.response.status_code == httpx.codes.CONFLICT:
+            existing = yield from _adopt_requestor(
+                self_link,
+                key,
+                structure_family,
+                normalized_specs,
+                metadata,
+                include_data_sources,
+            )
+            if existing is not None:
+                return existing, None, True
+        raise
+    document = response_json(response)
+
+    if structure_family == StructureFamily.container:
+        structure = {"contents": None, "count": None}
+    else:
+        # Only containers can have multiple data_sources right now.
+        (data_source,) = data_sources
+        structure = data_source.structure
+    item["attributes"]["structure"] = structure
+
+    # If server returned modified metadata update the local copy.
+    # Otherwise, round-trip it through a JSON serializer locally
+    # to ensure that any special types (e.g. datetimes, numpy arrays)
+    # are normalized to natively JSON serializable types.
+    if "metadata" in document:
+        item["attributes"]["metadata"] = document.pop("metadata")
+    else:
+        item["attributes"]["metadata"] = orjson.loads(
+            safe_json_dump(item["attributes"]["metadata"])
+        )
+
+    # Ditto for structure
+    if "structure" in document:
+        item["attributes"]["structure"] = STRUCTURE_TYPES[structure_family](
+            document.pop("structure")
+        )
+
+    # And for data sources
+    if "data_sources" in document:
+        item["attributes"]["data_sources"] = [ds for ds in document.pop("data_sources")]
+
+    # And for access_tags
+    if "access_tags" in document:
+        item["attributes"]["access_tags"] = document.pop("access_tags")
+
+    # Merge in "id" and "links" returned by the server.
+    item.update(document)
+
+    # Ensure this is a dataclass, not a dict.
+    # When we apply type hints and mypy to the client it should be possible
+    # to dispense with this.
+    if (structure_family != StructureFamily.container) and isinstance(structure, dict):
+        structure_type = STRUCTURE_TYPES[structure_family]
+        structure = structure_type.from_json(structure)
+
+    return item, structure, False
 
 
 class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
@@ -766,127 +1002,26 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
 
         self._cached_len = None
-        metadata = metadata or {}
-
-        # Backompatibility: if the server is older than 0.2.4,
-        # it can not accept the "properties" field in the data source.
-        # This can be removed in later releases.
-        if Version(self.context.server_info.library_version) < Version("0.2.4"):
-            data_sources_as_dicts = [
-                {k: v for k, v in asdict(ds).items() if k != "properties"}
-                for ds in data_sources
-            ]
-        else:
-            data_sources_as_dicts = [asdict(ds) for ds in data_sources]
-
-        item = {
-            "attributes": {
-                "ancestors": self.path_parts,
-                "metadata": metadata,
-                "structure_family": StructureFamily(structure_family),
-                "specs": normalize_specs(specs or []),
-                "data_sources": data_sources_as_dicts,
-                "access_tags": access_tags,
-            }
-        }
-        if key is None:
-            key = str(uuid.uuid4())
-        body = dict(item["attributes"])
-        body["id"] = key
-
-        if any(data_source.assets for data_source in data_sources):
-            endpoint = self.uri.replace("/metadata/", "/register/", 1)
-        else:
-            endpoint = self.uri
-
-        # Track whether any failed attempt may have been received and processed
-        # by the server: the request was sent but the response was lost (read/
-        # write transport error) or a proxy/server-side error (5xx) occurred
-        # after the fact. In that case a 409 Conflict on a subsequent retry
-        # most likely refers to the node created by our own earlier attempt
-        # (every create carries a key -- supplied or client-generated -- that
-        # acts as an idempotency token), so adopt it instead of failing.
-        may_have_reached_server = False
-        for attempt in retry_context():
-            with attempt:
-                try:
-                    document = handle_error(
-                        self.context.http_client.post(
-                            endpoint,
-                            headers={
-                                "Accept": MSGPACK_MIME_TYPE,
-                                "Content-Type": "application/json",
-                            },
-                            content=safe_json_dump(body),
-                        )
-                    ).json()
-                except SENT_REQUEST_TRANSPORT_ERRORS:
-                    may_have_reached_server = True
-                    raise
-                except httpx.HTTPStatusError as err:
-                    if err.response.status_code >= 500:
-                        may_have_reached_server = True
-                    elif (
-                        may_have_reached_server
-                        and err.response.status_code == httpx.codes.CONFLICT
-                    ):
-                        existing = self._adopt_after_retried_create_conflict(
-                            key,
-                            StructureFamily(structure_family),
-                            normalize_specs(specs or []),
-                            metadata,
-                        )
-                        if existing is not None:
-                            return existing
-                    raise
-
-        if structure_family == StructureFamily.container:
-            structure = {"contents": None, "count": None}
-        else:
-            # Only containers can have multiple data_sources right now.
-            (data_source,) = data_sources
-            structure = data_source.structure
-        item["attributes"]["structure"] = structure
-
-        # If server returned modified metadata update the local copy.
-        # Otherwise, round-trip it through a JSON serializer locally
-        # to ensure that any special types (e.g. datetimes, numpy arrays)
-        # are normalized to natively JSON serializable types.
-        if "metadata" in document:
-            item["attributes"]["metadata"] = document.pop("metadata")
-        else:
-            item["attributes"]["metadata"] = orjson.loads(
-                safe_json_dump(item["attributes"]["metadata"])
-            )
-
-        # Ditto for structure
-        if "structure" in document:
-            item["attributes"]["structure"] = STRUCTURE_TYPES[structure_family](
-                document.pop("structure")
-            )
-
-        # And for data sources
-        if "data_sources" in document:
-            item["attributes"]["data_sources"] = [
-                ds for ds in document.pop("data_sources")
-            ]
-
-        # And for access_tags
-        if "access_tags" in document:
-            item["attributes"]["access_tags"] = document.pop("access_tags")
-
-        # Merge in "id" and "links" returned by the server.
-        item.update(document)
-
-        # Ensure this is a dataclass, not a dict.
-        # When we apply type hints and mypy to the client it should be possible
-        # to dispense with this.
-        if (structure_family != StructureFamily.container) and isinstance(
-            structure, dict
-        ):
-            structure_type = STRUCTURE_TYPES[structure_family]
-            structure = structure_type.from_json(structure)
-
+        # The full orchestration lives in `_new_requestor`, shared with the
+        # async client; this shell only drives it and dispatches a client.
+        item, structure, adopted = send_requests(
+            _new_requestor(
+                self_link=self.uri,
+                ancestors=self.path_parts,
+                structure_family=structure_family,
+                data_sources=data_sources,
+                key=key,
+                metadata=metadata,
+                specs=specs,
+                access_tags=access_tags,
+                server_library_version=self.context.server_info.library_version,
+                include_data_sources=self._include_data_sources,
+            ),
+            self.context,
+        )
+        # When an existing node was adopted (after a retried create hit 409),
+        # `structure` is None and the client class parses the structure from
+        # the fetched item's attributes, exactly as in `__getitem__`.
         return client_for_item(
             self.context,
             self.structure_clients,
@@ -894,72 +1029,6 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             structure=structure,
             include_data_sources=self._include_data_sources,
         )
-
-    def _adopt_after_retried_create_conflict(
-        self, key, structure_family, specs, metadata
-    ):
-        """Fetch and return an existing node after a retried create hit 409 Conflict.
-
-        Called only when an earlier attempt of the same create request may have
-        reached the server (the response was lost to a transport error, or a
-        proxy/server returned 5xx after the fact), so the existing node under
-        `key` is most likely the one created by our own earlier attempt. To
-        guard against adopting a genuinely unrelated node (a true key
-        collision), the existing node must match the request: same structure
-        family, same specs, and the same metadata (compared after the same JSON
-        normalization that a create applies to the submitted metadata).
-        Otherwise return None and let the caller re-raise the original 409.
-
-        NB: a server-side spec validator that *modifies* metadata on ingestion
-        will defeat the metadata comparison, so in such deployments a retried
-        create degrades to the old behavior (the 409 is raised). This is the
-        conservative trade-off: never adopt a node we can not positively match.
-        """
-        try:
-            existing = self[key]
-        except Exception:
-            logger.warning(
-                "Create of %r returned 409 Conflict after a retried request, "
-                "but the existing item could not be fetched; treating as a "
-                "genuine conflict.",
-                key,
-            )
-            return None
-
-        existing_attrs = existing.item["attributes"]
-        existing_family = StructureFamily(existing_attrs["structure_family"])
-        # The elif chain evaluates lazily, so cheaper checks short-circuit the
-        # more expensive ones (the metadata check serializes the submitted
-        # metadata with the same JSON round-trip normalization that `new()`
-        # applies: numpy scalars, datetimes, etc. become plain JSON types).
-        if existing_family != structure_family:
-            mismatch = f"structure_family {existing_family!r} != {structure_family!r}"
-        elif _as_spec_set(existing_attrs.get("specs")) != _as_spec_set(specs):
-            mismatch = f"specs {existing_attrs.get('specs')!r} != {specs!r}"
-        elif existing_attrs.get("metadata") != orjson.loads(
-            safe_json_dump(metadata or {})
-        ):
-            mismatch = "metadata differs"
-        else:
-            mismatch = None
-
-        if mismatch is not None:
-            logger.warning(
-                "Create of %r returned 409 Conflict after a retried request, "
-                "but the existing item does not match the request (%s); "
-                "treating as a genuine conflict.",
-                key,
-                mismatch,
-            )
-            return None
-
-        logger.warning(
-            "Create of %r returned 409 Conflict after a retried request that "
-            "may have reached the server; adopting the existing (matching) "
-            "item as the result of this create.",
-            key,
-        )
-        return existing
 
     # When (re)chunking arrays for upload, we use this limit
     # to attempt to avoid bumping into size limits.
