@@ -6,17 +6,13 @@ import importlib
 import itertools
 import logging
 import time
-import uuid
 import warnings
-from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 import entrypoints
 import httpx
-import orjson
-from packaging.version import Version
 
 from ..iterviews import ItemsView, KeysView, ValuesView
 from ..queries import KeyLookup
@@ -30,17 +26,21 @@ from ..utils import (
     Sentinel,
     ensure_uri,
     node_repr,
-    safe_json_dump,
+)
+from ._container_protocol import (
+    CreateFailureAction,
+    build_create_request,
+    classify_create_failure,
+    match_existing_node,
+    merge_create_document,
 )
 from .base import STRUCTURE_TYPES, BaseClient
 from .utils import (
     MSGPACK_MIME_TYPE,
-    SENT_REQUEST_TRANSPORT_ERRORS,
     ClientError,
     client_for_item,
     export_util,
     handle_error,
-    normalize_specs,
     retry_context,
 )
 
@@ -51,13 +51,6 @@ if TYPE_CHECKING:
     from .stream import ContainerSubscription
 
 logger = logging.getLogger("tiled.client")
-
-
-def _as_spec_set(spec_dicts):
-    # Specs that have been passed through normalize_specs -- as well as the
-    # specs on a fetched item -- are lists of {"name": ..., "version": ...}
-    # dicts; represent them as a set for order-insensitive comparison.
-    return {(spec["name"], spec.get("version")) for spec in (spec_dicts or [])}
 
 
 class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
@@ -766,127 +759,47 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         """
 
         self._cached_len = None
-        metadata = metadata or {}
+        spec, item, key = build_create_request(
+            self.uri,
+            self.path_parts,
+            structure_family,
+            data_sources,
+            key=key,
+            metadata=metadata,
+            specs=specs,
+            access_tags=access_tags,
+            library_version=self.context.server_info.library_version,
+        )
 
-        # Backompatibility: if the server is older than 0.2.4,
-        # it can not accept the "properties" field in the data source.
-        # This can be removed in later releases.
-        if Version(self.context.server_info.library_version) < Version("0.2.4"):
-            data_sources_as_dicts = [
-                {k: v for k, v in asdict(ds).items() if k != "properties"}
-                for ds in data_sources
-            ]
-        else:
-            data_sources_as_dicts = [asdict(ds) for ds in data_sources]
-
-        item = {
-            "attributes": {
-                "ancestors": self.path_parts,
-                "metadata": metadata,
-                "structure_family": StructureFamily(structure_family),
-                "specs": normalize_specs(specs or []),
-                "data_sources": data_sources_as_dicts,
-                "access_tags": access_tags,
-            }
-        }
-        if key is None:
-            key = str(uuid.uuid4())
-        body = dict(item["attributes"])
-        body["id"] = key
-
-        if any(data_source.assets for data_source in data_sources):
-            endpoint = self.uri.replace("/metadata/", "/register/", 1)
-        else:
-            endpoint = self.uri
-
-        # Track whether any failed attempt may have been received and processed
-        # by the server: the request was sent but the response was lost (read/
-        # write transport error) or a proxy/server-side error (5xx) occurred
-        # after the fact. In that case a 409 Conflict on a subsequent retry
-        # most likely refers to the node created by our own earlier attempt
-        # (every create carries a key -- supplied or client-generated -- that
-        # acts as an idempotency token), so adopt it instead of failing.
+        # All failure semantics live in `classify_create_failure`; this loop
+        # is purely mechanical: send, classify, act on the decision, re-raise.
         may_have_reached_server = False
         for attempt in retry_context():
             with attempt:
                 try:
                     document = handle_error(
-                        self.context.http_client.post(
-                            endpoint,
-                            headers={
-                                "Accept": MSGPACK_MIME_TYPE,
-                                "Content-Type": "application/json",
-                            },
-                            content=safe_json_dump(body),
+                        self.context.http_client.request(
+                            spec.method,
+                            spec.url_path,
+                            params=spec.params,
+                            headers=spec.headers,
+                            content=spec.content,
                         )
                     ).json()
-                except SENT_REQUEST_TRANSPORT_ERRORS:
-                    may_have_reached_server = True
-                    raise
-                except httpx.HTTPStatusError as err:
-                    if err.response.status_code >= 500:
-                        may_have_reached_server = True
-                    elif (
-                        may_have_reached_server
-                        and err.response.status_code == httpx.codes.CONFLICT
-                    ):
+                except Exception as exc:
+                    decision = classify_create_failure(exc, may_have_reached_server)
+                    may_have_reached_server = decision.may_have_reached_server
+                    if decision.action is CreateFailureAction.TRY_ADOPT:
                         existing = self._adopt_after_retried_create_conflict(
-                            key,
-                            StructureFamily(structure_family),
-                            normalize_specs(specs or []),
-                            metadata,
+                            key, structure_family, specs, metadata
                         )
                         if existing is not None:
                             return existing
                     raise
 
-        if structure_family == StructureFamily.container:
-            structure = {"contents": None, "count": None}
-        else:
-            # Only containers can have multiple data_sources right now.
-            (data_source,) = data_sources
-            structure = data_source.structure
-        item["attributes"]["structure"] = structure
-
-        # If server returned modified metadata update the local copy.
-        # Otherwise, round-trip it through a JSON serializer locally
-        # to ensure that any special types (e.g. datetimes, numpy arrays)
-        # are normalized to natively JSON serializable types.
-        if "metadata" in document:
-            item["attributes"]["metadata"] = document.pop("metadata")
-        else:
-            item["attributes"]["metadata"] = orjson.loads(
-                safe_json_dump(item["attributes"]["metadata"])
-            )
-
-        # Ditto for structure
-        if "structure" in document:
-            item["attributes"]["structure"] = STRUCTURE_TYPES[structure_family](
-                document.pop("structure")
-            )
-
-        # And for data sources
-        if "data_sources" in document:
-            item["attributes"]["data_sources"] = [
-                ds for ds in document.pop("data_sources")
-            ]
-
-        # And for access_tags
-        if "access_tags" in document:
-            item["attributes"]["access_tags"] = document.pop("access_tags")
-
-        # Merge in "id" and "links" returned by the server.
-        item.update(document)
-
-        # Ensure this is a dataclass, not a dict.
-        # When we apply type hints and mypy to the client it should be possible
-        # to dispense with this.
-        if (structure_family != StructureFamily.container) and isinstance(
-            structure, dict
-        ):
-            structure_type = STRUCTURE_TYPES[structure_family]
-            structure = structure_type.from_json(structure)
-
+        item, structure = merge_create_document(
+            item, document, structure_family, data_sources
+        )
         return client_for_item(
             self.context,
             self.structure_clients,
@@ -907,8 +820,9 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
         guard against adopting a genuinely unrelated node (a true key
         collision), the existing node must match the request: same structure
         family, same specs, and the same metadata (compared after the same JSON
-        normalization that a create applies to the submitted metadata).
-        Otherwise return None and let the caller re-raise the original 409.
+        normalization that a create applies to the submitted metadata); the
+        match itself is pure and shared, in `match_existing_node`. Otherwise
+        return None and let the caller re-raise the original 409.
 
         NB: a server-side spec validator that *modifies* metadata on ingestion
         will defeat the metadata comparison, so in such deployments a retried
@@ -926,23 +840,9 @@ class Container(BaseClient, collections.abc.Mapping, IndexersMixin):
             )
             return None
 
-        existing_attrs = existing.item["attributes"]
-        existing_family = StructureFamily(existing_attrs["structure_family"])
-        # The elif chain evaluates lazily, so cheaper checks short-circuit the
-        # more expensive ones (the metadata check serializes the submitted
-        # metadata with the same JSON round-trip normalization that `new()`
-        # applies: numpy scalars, datetimes, etc. become plain JSON types).
-        if existing_family != structure_family:
-            mismatch = f"structure_family {existing_family!r} != {structure_family!r}"
-        elif _as_spec_set(existing_attrs.get("specs")) != _as_spec_set(specs):
-            mismatch = f"specs {existing_attrs.get('specs')!r} != {specs!r}"
-        elif existing_attrs.get("metadata") != orjson.loads(
-            safe_json_dump(metadata or {})
-        ):
-            mismatch = "metadata differs"
-        else:
-            mismatch = None
-
+        mismatch = match_existing_node(
+            existing.item["attributes"], structure_family, specs, metadata
+        )
         if mismatch is not None:
             logger.warning(
                 "Create of %r returned 409 Conflict after a retried request, "

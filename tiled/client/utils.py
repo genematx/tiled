@@ -183,6 +183,28 @@ def should_retry_if_unprocessed(exception: Exception) -> "bool | float":
     )
 
 
+def request_may_have_reached_server(exc: Exception) -> bool:
+    """Whether a failed request may nonetheless have been processed by the server.
+
+    True for read/write-phase transport errors (`SENT_REQUEST_TRANSPORT_ERRORS`:
+    the request was handed to the network layer, so the server may have
+    received and fully processed it even though the response was lost) and for
+    `httpx.HTTPStatusError` with a 5xx status (e.g. a 502/504 from a proxy in
+    front of a server that may have processed the request after the fact).
+    False otherwise -- in particular for connect-phase transport errors, which
+    guarantee the request never left the client.
+
+    This predicate is the complement of `should_retry_if_unprocessed`, which
+    whitelists the failures that GUARANTEE the server never processed the
+    request (connect-phase transport errors and 429 rejections). The two
+    express one taxonomy -- "may the mutation have happened?" -- from opposite
+    directions and should be read together.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, SENT_REQUEST_TRANSPORT_ERRORS)
+
+
 # Expose the timeout and max attempts as configurable via env vars. The rest of
 # the parameters (wait_initial, wait_jitter, etc.) are intentionally not
 # included here, for simplicity and to make it more difficult to configure
